@@ -92,7 +92,10 @@ class DreamContextSearchExtension:
                 )
                 continue
 
-            memories = [_format_context_hit(hit) for hit in hits or [] if hit.get("memory")]
+            hydrated_hits = _hydrate_context_hits(graph_db, hits or [], cube_id)
+            memories = [
+                _format_context_hit(hit) for hit in hydrated_hits if _context_hit_memory(hit)
+            ]
             if not memories:
                 continue
             buckets.append(
@@ -114,12 +117,14 @@ def _resolve_cube_ids(search_req: APISearchRequest) -> list[str]:
 def _format_context_hit(hit: dict[str, Any]) -> dict[str, Any]:
     context_id = str(hit.get("id", ""))
     score = float(hit.get("score", 0.0) or 0.0)
+    memory = _context_hit_memory(hit)
+    key = _context_hit_field(hit, "key", "")
     metadata = {
         "id": context_id,
-        "memory": hit.get("memory", ""),
+        "memory": memory,
         "memory_type": CONTEXT_MEMORY_TYPE,
-        "source": hit.get("source") or "dream",
-        "key": hit.get("key", ""),
+        "source": _context_hit_field(hit, "source", "dream") or "dream",
+        "key": key,
         "relativity": score,
         "score": score,
         "embedding": [],
@@ -128,12 +133,119 @@ def _format_context_hit(hit: dict[str, Any]) -> dict[str, Any]:
         "ref_id": f"[{context_id.split('-')[0]}]" if context_id else "[context]",
     }
     for field in ("created_at", "updated_at", "internal_info"):
-        if hit.get(field) is not None:
-            metadata[field] = hit[field]
+        value = _context_hit_field(hit, field)
+        if value is not None:
+            metadata[field] = value
 
     return {
         "id": context_id,
-        "memory": hit.get("memory", ""),
+        "memory": memory,
         "metadata": metadata,
         "ref_id": metadata["ref_id"],
     }
+
+
+def _hydrate_context_hits(
+    graph_db, hits: list[dict[str, Any]], cube_id: str
+) -> list[dict[str, Any]]:
+    missing_ids = [
+        str(hit.get("id", ""))
+        for hit in hits
+        if isinstance(hit, dict) and hit.get("id") and not _context_hit_memory(hit)
+    ]
+    if not missing_ids:
+        return hits
+
+    nodes_by_id = _fetch_context_nodes(graph_db, missing_ids, cube_id)
+    if not nodes_by_id:
+        return hits
+
+    hydrated: list[dict[str, Any]] = []
+    for hit in hits:
+        if not isinstance(hit, dict):
+            continue
+        node = nodes_by_id.get(str(hit.get("id", "")))
+        if node is None or _context_hit_memory(hit):
+            hydrated.append(hit)
+            continue
+        hydrated.append(_merge_context_hit_with_node(hit, node))
+    return hydrated
+
+
+def _fetch_context_nodes(graph_db, ids: list[str], cube_id: str) -> dict[str, dict[str, Any]]:
+    unique_ids = list(dict.fromkeys(ids))
+    nodes: list[dict[str, Any]] = []
+
+    get_nodes = getattr(graph_db, "get_nodes", None)
+    if callable(get_nodes):
+        try:
+            batch_nodes = get_nodes(unique_ids, user_name=cube_id, include_embedding=False)
+            if isinstance(batch_nodes, list):
+                nodes.extend(node for node in batch_nodes if isinstance(node, dict))
+        except TypeError:
+            try:
+                batch_nodes = get_nodes(unique_ids, user_name=cube_id)
+                if isinstance(batch_nodes, list):
+                    nodes.extend(node for node in batch_nodes if isinstance(node, dict))
+            except Exception:
+                logger.warning("[Dream Search] Context get_nodes fallback failed.", exc_info=True)
+        except Exception:
+            logger.warning("[Dream Search] Context get_nodes fallback failed.", exc_info=True)
+
+    found_ids = {str(node.get("id", "")) for node in nodes}
+    missing_ids = [node_id for node_id in unique_ids if node_id not in found_ids]
+    get_node = getattr(graph_db, "get_node", None)
+    if callable(get_node):
+        for node_id in missing_ids:
+            try:
+                node = get_node(node_id, user_name=cube_id, include_embedding=False)
+            except TypeError:
+                try:
+                    node = get_node(node_id, user_name=cube_id)
+                except Exception:
+                    logger.warning(
+                        "[Dream Search] Context get_node fallback failed for id=%s.",
+                        node_id,
+                        exc_info=True,
+                    )
+                    continue
+            except Exception:
+                logger.warning(
+                    "[Dream Search] Context get_node fallback failed for id=%s.",
+                    node_id,
+                    exc_info=True,
+                )
+                continue
+            if isinstance(node, dict):
+                nodes.append(node)
+
+    return {str(node.get("id", "")): node for node in nodes if node.get("id")}
+
+
+def _merge_context_hit_with_node(hit: dict[str, Any], node: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(hit)
+    metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+    merged["memory"] = node.get("memory", "") or metadata.get("memory", "")
+    for field in _CONTEXT_RETURN_FIELDS:
+        if field == "memory":
+            continue
+        if node.get(field) is not None:
+            merged[field] = node[field]
+        elif metadata.get(field) is not None:
+            merged[field] = metadata[field]
+    return merged
+
+
+def _context_hit_memory(hit: dict[str, Any]) -> str:
+    memory = hit.get("memory", "")
+    if memory:
+        return str(memory)
+    metadata = hit.get("metadata") if isinstance(hit.get("metadata"), dict) else {}
+    return str(metadata.get("memory", "") or "")
+
+
+def _context_hit_field(hit: dict[str, Any], field: str, default: Any | None = None) -> Any:
+    if hit.get(field) is not None:
+        return hit[field]
+    metadata = hit.get("metadata") if isinstance(hit.get("metadata"), dict) else {}
+    return metadata.get(field, default)

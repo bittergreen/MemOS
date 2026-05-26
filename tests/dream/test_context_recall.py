@@ -23,13 +23,19 @@ class FailingEmbedder:
 
 
 class FakeGraphDB:
-    def __init__(self, hits=None):
+    def __init__(self, hits=None, nodes=None):
         self.hits = hits or []
+        self.nodes = nodes or {}
         self.calls: list[dict] = []
+        self.get_nodes_calls: list[dict] = []
 
     def search_by_embedding(self, vector, **kwargs):
         self.calls.append({"vector": vector, **kwargs})
         return self.hits
+
+    def get_nodes(self, ids, **kwargs):
+        self.get_nodes_calls.append({"ids": ids, **kwargs})
+        return [self.nodes[node_id] for node_id in ids if node_id in self.nodes]
 
 
 class FakeCubeView:
@@ -146,6 +152,44 @@ def test_context_recall_searches_context_scope_and_returns_summary():
     assert memories[0]["metadata"]["key"] == "Dream context recall"
     assert memories[0]["metadata"]["relativity"] == 0.93
     assert memories[0]["metadata"]["internal_info"] == {"dream": {"memory_ids": ["m1", "m2"]}}
+
+
+def test_context_recall_hydrates_context_hit_when_return_fields_are_missing():
+    register_hook(
+        H.SEARCH_MEMORY_RESULTS,
+        DreamContextSearchExtension(top_k=1).merge_context_recall,
+    )
+    graph = FakeGraphDB(
+        hits=[{"id": "ctx_1", "score": 0.88}],
+        nodes={
+            "ctx_1": {
+                "id": "ctx_1",
+                "memory": "Hydrated Context summary.",
+                "metadata": {
+                    "key": "Hydrated Context",
+                    "source": "dream",
+                    "internal_info": {"dream": {"memory_ids": ["m1"]}},
+                },
+            }
+        },
+    )
+    handler = _handler(graph_db=graph)
+
+    response = handler.handle_search_memories(_search_req())
+
+    assert graph.get_nodes_calls == [
+        {
+            "ids": ["ctx_1"],
+            "user_name": "cube-a",
+            "include_embedding": False,
+        }
+    ]
+    memories = response.data["text_mem"][0]["memories"]
+    assert memories[0]["id"] == "ctx_1"
+    assert memories[0]["memory"] == "Hydrated Context summary."
+    assert memories[0]["metadata"]["key"] == "Hydrated Context"
+    assert memories[0]["metadata"]["relativity"] == 0.88
+    assert memories[0]["metadata"]["internal_info"] == {"dream": {"memory_ids": ["m1"]}}
 
 
 def test_context_recall_gracefully_skips_without_graph_db():
