@@ -399,6 +399,15 @@ class APISearchRequest(BaseRequest):
         description="Number of skill memories to retrieve (top-K). Default: 3.",
     )
 
+    context_format: Literal["memory", "sources"] = Field(
+        "memory",
+        description=(
+            "How textual memories should be rendered in search results. "
+            "'memory' returns extracted memory text; 'sources' returns original source text "
+            "from metadata.sources when available, falling back to memory text."
+        ),
+    )
+
     # ==== Filter conditions ====
     # TODO: maybe add detailed description later
     filter: dict[str, Any] | None = Field(

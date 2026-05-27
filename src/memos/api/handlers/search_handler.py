@@ -13,7 +13,10 @@ from contextlib import suppress
 from typing import Any
 
 from memos.api.handlers.base_handler import BaseHandler, HandlerDependencies
-from memos.api.handlers.formatters_handler import rerank_knowledge_mem
+from memos.api.handlers.formatters_handler import (
+    render_text_memories_from_sources,
+    rerank_knowledge_mem,
+)
 from memos.api.product_models import APISearchRequest, SearchResponse
 from memos.dream.contextualization import CONTEXT_MEMORY_TYPE
 from memos.log import get_logger
@@ -117,7 +120,10 @@ class SearchHandler(BaseHandler):
             text_mem=text_mem,
             top_k=search_req_local.top_k,
             file_mem_proportion=0.5,
+            strip_conversation_sources=search_req_local.context_format != "sources",
         )
+        if search_req_local.context_format == "sources":
+            results["text_mem"] = render_text_memories_from_sources(results["text_mem"])
 
         self.logger.info(
             f"[SearchHandler] Final search results: count={len(results)} results={results}"

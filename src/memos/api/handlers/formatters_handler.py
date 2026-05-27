@@ -14,6 +14,52 @@ from memos.templates.instruction_completion import instruct_completion
 logger = get_logger(__name__)
 
 
+def _source_value(source: Any, field: str, default: Any | None = None) -> Any:
+    if isinstance(source, dict):
+        return source.get(field, default)
+    return getattr(source, field, default)
+
+
+def _source_to_context_line(source: Any) -> str:
+    content = _source_value(source, "content", "")
+    if not content:
+        return ""
+
+    role = _source_value(source, "role", "")
+    chat_time = _source_value(source, "chat_time", "")
+    parts = []
+    if chat_time:
+        parts.append(f"[{chat_time}]")
+    if role:
+        parts.append(f"{role}:")
+    parts.append(str(content))
+    return " ".join(parts)
+
+
+def render_sources_as_context(memory: dict[str, Any]) -> str:
+    """Render original source snippets for a search result, preserving role and time."""
+    sources = memory.get("metadata", {}).get("sources") or []
+    rendered_sources: list[str] = []
+    seen: set[str] = set()
+    for source in sources:
+        line = _source_to_context_line(source).strip()
+        if not line or line in seen:
+            continue
+        seen.add(line)
+        rendered_sources.append(line)
+
+    if rendered_sources:
+        return "\n".join(rendered_sources)
+    return memory.get("memory", "")
+
+
+def render_text_memories_from_sources(text_mem: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for memory_group in text_mem:
+        for memory in memory_group.get("memories", []):
+            memory["memory"] = render_sources_as_context(memory)
+    return text_mem
+
+
 def to_iter(running: Any) -> list[Any]:
     """
     Normalize running tasks to a list of task objects.
@@ -164,6 +210,7 @@ def rerank_knowledge_mem(
     text_mem: list[dict[str, Any]],
     top_k: int,
     file_mem_proportion: float = 0.5,
+    strip_conversation_sources: bool = True,
 ) -> list[dict[str, Any]]:
     """
     Rerank knowledge memories and keep conversation memories.
@@ -193,8 +240,9 @@ def rerank_knowledge_mem(
         item["memory"] = item["metadata"]["sources"][0]["content"]
         item["metadata"]["sources"] = []
 
-    for item in conversation_mem:
-        item.setdefault("metadata", {})["sources"] = []
+    if strip_conversation_sources:
+        for item in conversation_mem:
+            item.setdefault("metadata", {})["sources"] = []
 
     # deduplicate: remove items with duplicate memory content
     original_count = len(reranked_knowledge_mem)
