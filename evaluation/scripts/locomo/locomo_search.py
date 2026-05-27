@@ -21,6 +21,36 @@ EVAL_SCRIPTS_DIR = os.path.join(ROOT_DIR, "evaluation", "scripts")
 sys.path.insert(0, ROOT_DIR)
 sys.path.insert(0, EVAL_SCRIPTS_DIR)
 
+try:
+    from locomo_capture_search_history import (
+        build_search_metadata_summary,
+        compact_db_metadata,
+        rendered_time_prefix,
+        slim_search_data,
+    )
+except ModuleNotFoundError:
+    from evaluation.scripts.locomo.locomo_capture_search_history import (
+        build_search_metadata_summary,
+        compact_db_metadata,
+        rendered_time_prefix,
+        slim_search_data,
+    )
+
+
+def _attach_inline_selector_debug(search_results):
+    for bucket in search_results.get("text_mem", []) or []:
+        for mem in bucket.get("memories", []) or []:
+            if not isinstance(mem, dict):
+                continue
+            metadata = mem.get("metadata") or {}
+            metadata_summary = build_search_metadata_summary(metadata)
+            mem["selector_debug"] = {
+                "search_metadata": metadata_summary,
+                "db_metadata": compact_db_metadata(metadata),
+                "rendered_time_prefix": rendered_time_prefix(mem.get("memory") or ""),
+            }
+    return search_results
+
 
 def mem0_search(client, query, speaker_a_user_id, speaker_b_user_id, top_k, speaker_a, speaker_b):
     from prompts import TEMPLATE_MEM0
@@ -45,7 +75,7 @@ def mem0_search(client, query, speaker_a_user_id, speaker_b_user_id, top_k, spea
         speaker_2_memories=json.dumps(search_speaker_b_memory, indent=4),
     )
     duration_ms = (time() - start) * 1000
-    return context, duration_ms
+    return context, duration_ms, None
 
 
 def mem0_graph_search(
@@ -93,7 +123,7 @@ def mem0_graph_search(
         speaker_2_graph_memories=json.dumps(search_speaker_b_graph, indent=4),
     )
     duration_ms = (time() - start) * 1000
-    return context, duration_ms
+    return context, duration_ms, None
 
 
 def memos_api_search(
@@ -122,7 +152,27 @@ def memos_api_search(
     )
 
     duration_ms = (time() - start) * 1000
-    return context, duration_ms
+    search_a_results = _attach_inline_selector_debug(search_a_results)
+    search_b_results = _attach_inline_selector_debug(search_b_results)
+    capture_payload = {
+        "speaker_a": {
+            "user_id": speaker_a_user_id,
+            "raw": slim_search_data(search_a_results),
+            "enriched_items": sum(
+                len(bucket.get("memories") or [])
+                for bucket in (search_a_results.get("text_mem") or [])
+            ),
+        },
+        "speaker_b": {
+            "user_id": speaker_b_user_id,
+            "raw": slim_search_data(search_b_results),
+            "enriched_items": sum(
+                len(bucket.get("memories") or [])
+                for bucket in (search_b_results.get("text_mem") or [])
+            ),
+        },
+    }
+    return context, duration_ms, capture_payload
 
 
 def memobase_search(
@@ -141,7 +191,7 @@ def memobase_search(
         speaker_2_memories=search_b_results,
     )
     duration_ms = (time() - start) * 1000
-    return context, duration_ms
+    return context, duration_ms, None
 
 
 def memu_search(client, query, speaker_a_user_id, speaker_b_user_id, top_k, speaker_a, speaker_b):
@@ -161,7 +211,7 @@ def memu_search(client, query, speaker_a_user_id, speaker_b_user_id, top_k, spea
         speaker_2_memories=search_speaker_b_memory,
     )
     duration_ms = (time() - start) * 1000
-    return context, duration_ms
+    return context, duration_ms, None
 
 
 def supermemory_search(
@@ -180,7 +230,7 @@ def supermemory_search(
         speaker_2_memories=search_speaker_b_results,
     )
     duration_ms = (time() - start) * 1000
-    return context, duration_ms
+    return context, duration_ms, None
 
 
 def search_query(client, query, metadata, frame, version, top_k=20):
@@ -191,50 +241,64 @@ def search_query(client, query, metadata, frame, version, top_k=20):
     speaker_b_user_id = metadata.get("speaker_b_user_id")
 
     if frame == "mem0":
-        context, duration_ms = mem0_search(
+        context, duration_ms, _ = mem0_search(
             client, query, speaker_a_user_id, speaker_b_user_id, top_k, speaker_a, speaker_b
         )
     elif frame == "mem0_graph":
-        context, duration_ms = mem0_graph_search(
+        context, duration_ms, _ = mem0_graph_search(
             client, query, speaker_a_user_id, speaker_b_user_id, top_k, speaker_a, speaker_b
         )
     elif "memos-api" in frame:
-        context, duration_ms = memos_api_search(
+        context, duration_ms, capture_payload = memos_api_search(
             client, query, speaker_a_user_id, speaker_b_user_id, top_k, speaker_a, speaker_b
         )
+        return context, duration_ms, capture_payload
     elif frame == "memobase":
-        context, duration_ms = memobase_search(
+        context, duration_ms, _ = memobase_search(
             client, query, speaker_a_user_id, speaker_b_user_id, top_k, speaker_a, speaker_b
         )
     elif frame == "memu":
-        context, duration_ms = memu_search(
+        context, duration_ms, _ = memu_search(
             client, query, speaker_a_user_id, speaker_b_user_id, top_k, speaker_a, speaker_b
         )
     elif frame == "supermemory":
         conv_idx = metadata["conv_idx"]
         speaker_a_user_id = f"lcm{conv_idx}a_{version}"
         speaker_b_user_id = f"lcm{conv_idx}b_{version}"
-        context, duration_ms = supermemory_search(
+        context, duration_ms, _ = supermemory_search(
             client, query, speaker_a_user_id, speaker_b_user_id, top_k, speaker_a, speaker_b
         )
-    return context, duration_ms
+    else:
+        context, duration_ms, _ = mem0_search(
+            client, query, speaker_a_user_id, speaker_b_user_id, top_k, speaker_a, speaker_b
+        )
+    return context, duration_ms, None
 
 
 def load_existing_results(frame, version, group_idx):
     result_path = (
         f"results/locomo/{frame}-{version}/tmp/{frame}_locomo_search_results_{group_idx}.json"
     )
+    capture_path = (
+        f"results/locomo/{frame}-{version}/tmp/{frame}_locomo_search_with_history_{group_idx}.json"
+    )
     if os.path.exists(result_path):
         try:
             with open(result_path) as f:
-                return json.load(f), True
+                search_results = json.load(f)
+            capture_results = {}
+            if os.path.exists(capture_path):
+                with open(capture_path) as f:
+                    capture_results = json.load(f)
+            return search_results, capture_results, True
         except Exception as e:
             print(f"Error loading existing results for group {group_idx}: {e}")
-    return {}, False
+    return {}, {}, False
 
 
 def process_user(conv_idx, locomo_df, frame, version, top_k=20, num_workers=1):
     search_results = defaultdict(list)
+    capture_results = defaultdict(list)
     qa_set = locomo_df["qa"].iloc[conv_idx]
     conversation = locomo_df["conversation"].iloc[conv_idx]
     speaker_a = conversation.get("speaker_a")
@@ -243,10 +307,12 @@ def process_user(conv_idx, locomo_df, frame, version, top_k=20, num_workers=1):
     speaker_b_user_id = f"locomo_exp_user_{conv_idx}_speaker_b_{version}"
     conv_id = f"locomo_exp_user_{conv_idx}"
 
-    existing_results, loaded = load_existing_results(frame, version, conv_idx)
+    existing_results, existing_capture_results, loaded = load_existing_results(
+        frame, version, conv_idx
+    )
     if loaded:
         print(f"Loaded existing results for group {conv_idx}")
-        return existing_results
+        return existing_results, existing_capture_results
 
     client = None
     if frame == "mem0" or frame == "mem0_graph":
@@ -287,12 +353,27 @@ def process_user(conv_idx, locomo_df, frame, version, top_k=20, num_workers=1):
         query = qa.get("question")
         if qa.get("category") == 5:
             return None
-        context, duration_ms = search_query(client, query, metadata, frame, version, top_k=top_k)
+        context, duration_ms, capture_payload = search_query(
+            client, query, metadata, frame, version, top_k=top_k
+        )
 
         if not context:
             print(f"No context found for query: {query}")
             context = ""
-        return {"query": query, "context": context, "duration_ms": duration_ms}
+        result = {"query": query, "context": context, "duration_ms": duration_ms}
+        capture_result = None
+        if capture_payload is not None:
+            capture_result = {
+                "conv_idx": conv_idx,
+                "question": query,
+                "category": qa.get("category"),
+                "golden_answer": qa.get("answer"),
+                "evidence": qa.get("evidence") or [],
+                "search_duration_ms": duration_ms,
+                "speaker_a": capture_payload["speaker_a"],
+                "speaker_b": capture_payload["speaker_b"],
+            }
+        return result, capture_result
 
     futures = []
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
@@ -304,7 +385,10 @@ def process_user(conv_idx, locomo_df, frame, version, top_k=20, num_workers=1):
         ):
             result = future.result()
             if result:
-                search_results[conv_id].append(result)
+                search_result, capture_result = result
+                search_results[conv_id].append(search_result)
+                if capture_result is not None:
+                    capture_results[conv_id].append(capture_result)
 
     os.makedirs(f"results/locomo/{frame}-{version}/tmp/", exist_ok=True)
     with open(
@@ -312,8 +396,15 @@ def process_user(conv_idx, locomo_df, frame, version, top_k=20, num_workers=1):
     ) as f:
         json.dump(dict(search_results), f, indent=2)
         print(f"Save search results {conv_idx}")
+    if capture_results:
+        with open(
+            f"results/locomo/{frame}-{version}/tmp/{frame}_locomo_search_with_history_{conv_idx}.json",
+            "w",
+        ) as f:
+            json.dump(dict(capture_results), f, ensure_ascii=False, indent=2)
+            print(f"Save search-with-history results {conv_idx}")
 
-    return search_results
+    return search_results, capture_results
 
 
 def main(frame, version="default", num_workers=1, top_k=20):
@@ -323,16 +414,43 @@ def main(frame, version="default", num_workers=1, top_k=20):
     num_users = 10
     os.makedirs(f"results/locomo/{frame}-{version}/", exist_ok=True)
     all_search_results = defaultdict(list)
+    all_capture_results = defaultdict(list)
 
     for idx in range(num_users):
         print(f"Processing user {idx}...")
-        user_results = process_user(idx, locomo_df, frame, version, top_k, num_workers)
+        user_results, user_capture_results = process_user(
+            idx, locomo_df, frame, version, top_k, num_workers
+        )
         for conv_id, results in user_results.items():
             all_search_results[conv_id].extend(results)
+        for conv_id, results in user_capture_results.items():
+            all_capture_results[conv_id].extend(results)
 
     with open(f"results/locomo/{frame}-{version}/{frame}_locomo_search_results.json", "w") as f:
         json.dump(dict(all_search_results), f, indent=2)
         print("Save all search results")
+    if all_capture_results:
+        capture_output = {
+            "meta": {
+                "input": os.path.join(ROOT_DIR, "data", "locomo", "locomo10.json"),
+                "base_url": os.getenv("MEMOS_URL", "http://127.0.0.1:8001"),
+                "version": version,
+                "top_k": top_k,
+                "mode": os.getenv("SEARCH_MODE", "fast"),
+                "pref_top_k": 6,
+                "selected_conversations": list(range(num_users)),
+                "wrong_only_from": None,
+                "wrong_threshold": None,
+            },
+            "results": dict(all_capture_results),
+        }
+        with open(
+            f"results/locomo/{frame}-{version}/{frame}_locomo_search_with_history.json",
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(capture_output, f, ensure_ascii=False, indent=2)
+            print("Save all search-with-history results")
 
 
 if __name__ == "__main__":

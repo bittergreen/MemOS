@@ -1,19 +1,31 @@
 import json
 import os
 import sys
+import threading
 import time
 import uuid
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import suppress
 from datetime import datetime
 
 import requests
 
 from dotenv import load_dotenv
+from requests import RequestException
 
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 load_dotenv()
+
+
+def _normalize_async_mode(async_mode: str | None) -> str | None:
+    if async_mode is None:
+        return None
+    val = str(async_mode).strip().lower()
+    if val in ("sync", "async"):
+        return val
+    return None
 
 
 class ZepClient:
@@ -146,72 +158,223 @@ class MemosApiClient:
     def __init__(self):
         self.memos_url = os.getenv("MEMOS_URL")
         self.headers = {"Content-Type": "application/json", "Authorization": os.getenv("MEMOS_KEY")}
+        self._pending_user_ids: set[str] = set()
+        self._task_lock = threading.Lock()
+        self.max_retries = int(os.getenv("MEMOS_API_MAX_RETRIES", "5"))
+        self.base_retry_seconds = float(os.getenv("MEMOS_API_RETRY_BASE_SECONDS", "1"))
+        self.request_timeout = float(os.getenv("MEMOS_API_TIMEOUT_SECONDS", "120"))
 
-    def add(self, messages, user_id, conv_id, batch_size: int = 9999):
+    def _request_with_retry(self, method: str, url: str, payload: str, op_name: str, context: str):
+        last_error = None
+        for attempt in range(self.max_retries):
+            try:
+                response = requests.request(
+                    method,
+                    url,
+                    data=payload,
+                    headers=self.headers,
+                    timeout=self.request_timeout,
+                )
+                if response.status_code in {429, 500, 502, 503, 504}:
+                    wait_seconds = self.base_retry_seconds * (2**attempt)
+                    response_preview = (response.text or "").strip()[:500]
+                    if attempt < self.max_retries - 1:
+                        print(
+                            f"⚠️  memos_api {op_name} retry {attempt + 1}/{self.max_retries} got "
+                            f"status={response.status_code}: {context}. "
+                            f"response={response_preview!r}. Retrying in {wait_seconds:.1f}s."
+                        )
+                        time.sleep(wait_seconds)
+                        continue
+                    raise RuntimeError(
+                        f"MemOS {op_name} failed after {self.max_retries} attempts with "
+                        f"status={response.status_code}: {context}. response={response_preview!r}"
+                    )
+                return response
+            except RequestException as e:
+                last_error = e
+                wait_seconds = self.base_retry_seconds * (2**attempt)
+                if attempt < self.max_retries - 1:
+                    print(
+                        f"⚠️  memos_api {op_name} retry {attempt + 1}/{self.max_retries} failed: "
+                        f"{context}. error={e!r}. Retrying in {wait_seconds:.1f}s."
+                    )
+                    time.sleep(wait_seconds)
+                else:
+                    raise RuntimeError(
+                        f"MemOS {op_name} request failed after {self.max_retries} attempts: "
+                        f"{context}. last_error={last_error!r}"
+                    ) from e
+
+    def add(
+        self,
+        messages,
+        user_id,
+        conv_id,
+        batch_size: int = 9999,
+        allow_memory_view=None,
+        task_id: str | None = None,
+        async_mode: str = "sync",
+    ):
         """
         messages = [{"role": "assistant", "content": data, "chat_time": date_str}]
         """
         url = f"{self.memos_url}/product/add"
         added_memories = []
-        for i in range(0, len(messages), batch_size):
+        num_batches = -(-len(messages) // batch_size)
+        for batch_idx, i in enumerate(range(0, len(messages), batch_size)):
             batch_messages = messages[i : i + batch_size]
-            payload = json.dumps(
-                {
-                    "messages": batch_messages,
-                    "user_id": user_id,
-                    "mem_cube_id": user_id,
-                    "conversation_id": conv_id,
-                }
+            effective_task_id = (
+                f"{task_id}_b{batch_idx}" if task_id and num_batches > 1 else task_id
             )
-            response = requests.request("POST", url, data=payload, headers=self.headers)
-            assert response.status_code == 200, response.text
-            assert json.loads(response.text)["message"] == "Memory added successfully", (
-                response.text
-            )
-            added_memories += json.loads(response.text)["data"]
-        return added_memories
-
-    def search(self, query, user_id, top_k):
-        """Search memories."""
-        url = f"{self.memos_url}/product/search"
-        payload = json.dumps(
-            {
-                "query": query,
+            body = {
+                "messages": batch_messages,
                 "user_id": user_id,
                 "mem_cube_id": user_id,
-                "conversation_id": "",
-                "top_k": top_k,
-                "mode": os.getenv("SEARCH_MODE", "fast"),
-                "include_preference": True,
-                "pref_top_k": 6,
-                "context_format": os.getenv("MEMOS_SEARCH_CONTEXT_FORMAT", "memory"),
-            },
-            ensure_ascii=False,
-        )
-        response = requests.request("POST", url, data=payload, headers=self.headers)
-        assert response.status_code == 200, response.text
-        assert json.loads(response.text)["message"] == "Search completed successfully", (
-            response.text
-        )
-        return json.loads(response.text)["data"]
+                "conversation_id": conv_id,
+                "async_mode": _normalize_async_mode(async_mode) or "sync",
+            }
+            if effective_task_id:
+                body["task_id"] = effective_task_id
+            if allow_memory_view:
+                body["allow_memory_view"] = allow_memory_view
+            payload = json.dumps(body)
+            context = (
+                f"user_id={user_id}, conv_id={conv_id}, task_id={effective_task_id}, "
+                f"batch_idx={batch_idx}, batch_size={len(batch_messages)}"
+            )
+            response = self._request_with_retry("POST", url, payload, "add", context)
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"MemOS add failed with status={response.status_code}: {context}. "
+                    f"response={response.text}"
+                )
+            try:
+                response_json = json.loads(response.text)
+            except json.JSONDecodeError as e:
+                raise RuntimeError(
+                    f"MemOS add returned non-JSON response: {context}. response={response.text}"
+                ) from e
+            if response_json.get("message") != "Memory added successfully":
+                raise RuntimeError(
+                    f"MemOS add returned unexpected payload: {context}. response={response.text}"
+                )
+            added_memories += response_json["data"]
+        with self._task_lock:
+            self._pending_user_ids.add(user_id)
+        return added_memories
+
+    def search(self, query, user_id, top_k, reference_time=None):
+        """Search memories."""
+        url = f"{self.memos_url}/product/search"
+        body = {
+            "query": query,
+            "user_id": user_id,
+            "mem_cube_id": user_id,
+            "conversation_id": "",
+            "top_k": top_k,
+            "mode": os.getenv("SEARCH_MODE", "fast"),
+            "include_preference": True,
+            "pref_top_k": 6,
+            "context_format": os.getenv("MEMOS_SEARCH_CONTEXT_FORMAT", "memory"),
+        }
+        if reference_time:
+            body["reference_time"] = reference_time
+        payload = json.dumps(body, ensure_ascii=False)
+        context = f"user_id={user_id}, top_k={top_k}, query={query[:120]!r}"
+        response = self._request_with_retry("POST", url, payload, "search", context)
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"MemOS search failed with status={response.status_code}: {context}. "
+                f"response={response.text}"
+            )
+        try:
+            response_json = json.loads(response.text)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"MemOS search returned non-JSON response: {context}. response={response.text}"
+            ) from e
+        if response_json.get("message") != "Search completed successfully":
+            raise RuntimeError(
+                f"MemOS search returned unexpected payload: {context}. response={response.text}"
+            )
+        return response_json["data"]
+
+    def wait_for_all_tasks(self, interval=5.0, timeout=1800.0, poll_workers=10):
+        with self._task_lock:
+            user_ids = sorted(self._pending_user_ids)
+            self._pending_user_ids.clear()
+        if not user_ids:
+            print("No pending tasks to wait for.")
+            return
+
+        print(f"Waiting for async tasks across {len(user_ids)} user(s) to complete...")
+        url = f"{self.memos_url}/product/scheduler/status"
+        active_states = {"waiting", "pending", "in_progress"}
+
+        def _poll_user(uid):
+            start = time.time()
+            while True:
+                resp = requests.get(url, params={"user_id": uid}, timeout=30)
+                resp.raise_for_status()
+                data = resp.json()
+                items = data.get("data", []) if isinstance(data, dict) else []
+                statuses = {item.get("status") for item in items if isinstance(item, dict)}
+                if not statuses or statuses.isdisjoint(active_states):
+                    return uid
+                if (time.time() - start) > timeout:
+                    raise TimeoutError(
+                        f"Timeout waiting for user {uid} after {timeout}s; "
+                        f"remaining statuses: {statuses}"
+                    )
+                time.sleep(interval)
+
+        with ThreadPoolExecutor(max_workers=poll_workers) as executor:
+            futures = {executor.submit(_poll_user, uid): uid for uid in user_ids}
+            for completed, future in enumerate(as_completed(futures), start=1):
+                uid = futures[future]
+                future.result()
+                print(f"  [{completed}/{len(user_ids)}] All tasks for user {uid} completed")
+        print(f"All async tasks across {len(user_ids)} user(s) completed.")
 
 
 class MemosApiOnlineClient:
     def __init__(self):
         self.memos_url = os.getenv("MEMOS_ONLINE_URL")
         self.headers = {"Content-Type": "application/json", "Authorization": os.getenv("MEMOS_KEY")}
+        self._pending_user_ids: set[str] = set()
+        self._task_lock = threading.Lock()
 
-    def add(self, messages, user_id, conv_id=None, batch_size: int = 9999):
+    def add(
+        self,
+        messages,
+        user_id,
+        conv_id=None,
+        batch_size: int = 9999,
+        allow_memory_view=None,
+        task_id: str | None = None,
+        async_mode: str | None = None,
+    ):
         url = f"{self.memos_url}/add/message"
-        for i in range(0, len(messages), batch_size):
+        num_batches = -(-len(messages) // batch_size)
+        for batch_idx, i in enumerate(range(0, len(messages), batch_size)):
             batch_messages = messages[i : i + batch_size]
-            payload = json.dumps(
-                {
-                    "messages": batch_messages,
-                    "user_id": user_id,
-                    "conversation_id": conv_id,
-                }
+            effective_task_id = (
+                f"{task_id}_b{batch_idx}" if task_id and num_batches > 1 else task_id
             )
+            body = {
+                "messages": batch_messages,
+                "user_id": user_id,
+                "conversation_id": conv_id,
+            }
+            if effective_task_id:
+                body["task_id"] = effective_task_id
+            if allow_memory_view:
+                body["allow_memory_view"] = allow_memory_view
+            am = _normalize_async_mode(async_mode)
+            if am:
+                body["async_mode"] = am
+            payload = json.dumps(body)
 
             max_retries = 5
             for attempt in range(max_retries):
@@ -225,20 +388,23 @@ class MemosApiOnlineClient:
                         time.sleep(2**attempt)
                     else:
                         raise e
+        with self._task_lock:
+            self._pending_user_ids.add(user_id)
 
-    def search(self, query, user_id, top_k):
+    def search(self, query, user_id, top_k, reference_time=None):
         """Search memories."""
         url = f"{self.memos_url}/search/memory"
-        payload = json.dumps(
-            {
-                "query": query,
-                "user_id": user_id,
-                "memory_limit_number": top_k,
-                "mode": os.getenv("SEARCH_MODE", "fast"),
-                "include_preference": True,
-                "pref_top_k": 6,
-            }
-        )
+        body = {
+            "query": query,
+            "user_id": user_id,
+            "memory_limit_number": top_k,
+            "mode": os.getenv("SEARCH_MODE", "fast"),
+            "include_preference": True,
+            "pref_top_k": 6,
+        }
+        if reference_time:
+            body["reference_time"] = reference_time
+        payload = json.dumps(body)
 
         max_retries = 5
         for attempt in range(max_retries):
@@ -273,6 +439,44 @@ class MemosApiOnlineClient:
                     time.sleep(2**attempt)
                 else:
                     raise e
+
+    def wait_for_all_tasks(self, interval=5.0, timeout=1800.0, poll_workers=10):
+        with self._task_lock:
+            user_ids = sorted(self._pending_user_ids)
+            self._pending_user_ids.clear()
+        if not user_ids:
+            print("No pending tasks to wait for.")
+            return
+
+        print(f"Waiting for async tasks across {len(user_ids)} user(s) to complete...")
+        status_base = os.getenv("MEMOS_URL", self.memos_url)
+        url = f"{status_base}/product/scheduler/status"
+        active_states = {"waiting", "pending", "in_progress"}
+
+        def _poll_user(uid):
+            start = time.time()
+            while True:
+                resp = requests.get(url, params={"user_id": uid}, timeout=30)
+                resp.raise_for_status()
+                data = resp.json()
+                items = data.get("data", []) if isinstance(data, dict) else []
+                statuses = {item.get("status") for item in items if isinstance(item, dict)}
+                if not statuses or statuses.isdisjoint(active_states):
+                    return uid
+                if (time.time() - start) > timeout:
+                    raise TimeoutError(
+                        f"Timeout waiting for user {uid} after {timeout}s; "
+                        f"remaining statuses: {statuses}"
+                    )
+                time.sleep(interval)
+
+        with ThreadPoolExecutor(max_workers=poll_workers) as executor:
+            futures = {executor.submit(_poll_user, uid): uid for uid in user_ids}
+            for completed, future in enumerate(as_completed(futures), start=1):
+                uid = futures[future]
+                future.result()
+                print(f"  [{completed}/{len(user_ids)}] All tasks for user {uid} completed")
+        print(f"All async tasks across {len(user_ids)} user(s) completed.")
 
 
 class SupermemoryClient:
