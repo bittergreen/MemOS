@@ -1,4 +1,9 @@
+import copy
+import importlib
+import re
 import traceback
+
+from concurrent.futures import as_completed
 
 from memos.context.context import ContextThreadPoolExecutor
 from memos.embedders.factory import OllamaEmbedder
@@ -9,6 +14,7 @@ from memos.memories.textual.item import SearchedTreeNodeTextualMemoryMetadata, T
 from memos.memories.textual.tree_text_memory.retrieve.bm25_util import EnhancedBM25
 from memos.memories.textual.tree_text_memory.retrieve.retrieve_utils import (
     FastTokenizer,
+    StopwordManager,
     cosine_similarity_matrix,
     detect_lang,
     find_best_unrelated_subgroup,
@@ -29,6 +35,8 @@ from .task_goal_parser import TaskGoalParser
 
 
 logger = get_logger(__name__)
+KEYWORD_EXTRACT_TOP_K = 3
+KEYWORD_ALLOW_POS = ("n", "nr", "nrt", "ns", "nt", "nz", "vn", "v", "t", "eng", "m")
 COT_DICT = {
     "fine": {"en": COT_PROMPT, "zh": COT_PROMPT_ZH},
     "fast": {"en": SIMPLE_COT_PROMPT, "zh": SIMPLE_COT_PROMPT_ZH},
@@ -64,9 +72,34 @@ class Searcher:
         self.internet_retriever = internet_retriever
         self.vec_cot = search_strategy.get("cot", False) if search_strategy else False
         self.use_fast_graph = search_strategy.get("fast_graph", False) if search_strategy else False
+        self.use_fulltext = search_strategy.get("fulltext", False) if search_strategy else False
         self.manual_close_internet = manual_close_internet
         self.tokenizer = tokenizer
         self._usage_executor = ContextThreadPoolExecutor(max_workers=4, thread_name_prefix="usage")
+
+    def _maybe_rerank(
+        self,
+        enabled: bool,
+        *,
+        query: str,
+        graph_results: list[TextualMemoryItem],
+        top_k: int,
+        **kwargs,
+    ) -> list[tuple[TextualMemoryItem, float]]:
+        if not enabled or self.reranker is None:
+            return [(item, 0.0) for item in graph_results[:top_k]]
+        return self.reranker.rerank(
+            query=query,
+            graph_results=graph_results,
+            top_k=top_k,
+            **kwargs,
+        )
+
+    @staticmethod
+    def _query_embedding_for_rerank(enabled: bool, query_embedding):
+        if not enabled:
+            return None
+        return query_embedding[0]
 
     @timed
     def retrieve(
@@ -81,12 +114,17 @@ class Searcher:
         user_name: str | None = None,
         search_tool_memory: bool = False,
         tool_mem_top_k: int = 6,
+        include_skill_memory: bool = False,
+        skill_mem_top_k: int = 3,
+        include_preference_memory: bool = False,
+        pref_mem_top_k: int = 6,
         **kwargs,
     ) -> list[tuple[TextualMemoryItem, float]]:
         logger.info(
-            f"[RECALL] Start query='{query}', top_k={top_k}, mode={mode}, memory_type={memory_type}"
+            f"[RECALL] Start query='{query}', top_k={top_k}, mode={mode}, memory_type={memory_type}, user_name={user_name}"
         )
-        parsed_goal, query_embedding, context, query = self._parse_task(
+        rerank = bool(kwargs.get("rerank", True))
+        parsed_goal, query_embedding, _context, query = self._parse_task(
             query,
             info,
             mode,
@@ -108,6 +146,11 @@ class Searcher:
             user_name,
             search_tool_memory,
             tool_mem_top_k,
+            include_skill_memory,
+            skill_mem_top_k,
+            include_preference_memory,
+            pref_mem_top_k,
+            rerank,
         )
         return results
 
@@ -119,6 +162,10 @@ class Searcher:
         info=None,
         search_tool_memory: bool = False,
         tool_mem_top_k: int = 6,
+        include_skill_memory: bool = False,
+        skill_mem_top_k: int = 3,
+        include_preference_memory: bool = False,
+        pref_mem_top_k: int = 6,
         dedup: str | None = None,
         plugin=False,
     ):
@@ -127,7 +174,15 @@ class Searcher:
         else:
             deduped = self._deduplicate_results(retrieved_results)
         final_results = self._sort_and_trim(
-            deduped, top_k, plugin, search_tool_memory, tool_mem_top_k
+            deduped,
+            top_k,
+            plugin,
+            search_tool_memory,
+            tool_mem_top_k,
+            include_skill_memory,
+            skill_mem_top_k,
+            include_preference_memory,
+            pref_mem_top_k,
         )
         self._update_usage_history(final_results, info, user_name)
         return final_results
@@ -145,6 +200,10 @@ class Searcher:
         user_name: str | None = None,
         search_tool_memory: bool = False,
         tool_mem_top_k: int = 6,
+        include_skill_memory: bool = False,
+        skill_mem_top_k: int = 3,
+        include_preference_memory: bool = False,
+        pref_mem_top_k: int = 6,
         dedup: str | None = None,
         **kwargs,
     ) -> list[TextualMemoryItem]:
@@ -192,6 +251,10 @@ class Searcher:
                 user_name=user_name,
                 search_tool_memory=search_tool_memory,
                 tool_mem_top_k=tool_mem_top_k,
+                include_skill_memory=include_skill_memory,
+                skill_mem_top_k=skill_mem_top_k,
+                include_preference_memory=include_preference_memory,
+                pref_mem_top_k=pref_mem_top_k,
                 **kwargs,
             )
 
@@ -207,6 +270,10 @@ class Searcher:
             plugin=kwargs.get("plugin", False),
             search_tool_memory=search_tool_memory,
             tool_mem_top_k=tool_mem_top_k,
+            include_skill_memory=include_skill_memory,
+            skill_mem_top_k=skill_mem_top_k,
+            include_preference_memory=include_preference_memory,
+            pref_mem_top_k=pref_mem_top_k,
             dedup=dedup,
         )
 
@@ -242,7 +309,7 @@ class Searcher:
 
             # retrieve related nodes by embedding
             related_nodes = [
-                self.graph_store.get_node(n["id"])
+                self.graph_store.get_node(n["id"], user_name=user_name)
                 for n in self.graph_store.search_by_embedding(
                     query_embedding,
                     top_k=top_k,
@@ -286,8 +353,8 @@ class Searcher:
         query = parsed_goal.rephrased_query or query
         # if goal has extra memories, embed them too
         if parsed_goal.memories:
-            query_embedding = self.embedder.embed(list({query, *parsed_goal.memories}))
-
+            embed_texts = list(dict.fromkeys([query, *parsed_goal.memories]))
+            query_embedding = self.embedder.embed(embed_texts)
         return parsed_goal, query_embedding, context, query
 
     @timed
@@ -305,8 +372,13 @@ class Searcher:
         user_name: str | None = None,
         search_tool_memory: bool = False,
         tool_mem_top_k: int = 6,
+        include_skill_memory: bool = False,
+        skill_mem_top_k: int = 3,
+        include_preference_memory: bool = False,
+        pref_mem_top_k: int = 6,
+        rerank: bool = True,
     ):
-        """Run A/B/C retrieval paths in parallel"""
+        """Run A/B/C/D/E/F retrieval paths in parallel"""
         tasks = []
         id_filter = {
             "user_id": info.get("user_id", None),
@@ -314,7 +386,7 @@ class Searcher:
         }
         id_filter = {k: v for k, v in id_filter.items() if v is not None}
 
-        with ContextThreadPoolExecutor(max_workers=3) as executor:
+        with ContextThreadPoolExecutor(max_workers=5) as executor:
             tasks.append(
                 executor.submit(
                     self._retrieve_from_working_memory,
@@ -327,6 +399,7 @@ class Searcher:
                     search_priority,
                     user_name,
                     id_filter,
+                    rerank=rerank,
                 )
             )
             tasks.append(
@@ -342,6 +415,7 @@ class Searcher:
                     user_name,
                     id_filter,
                     mode=mode,
+                    rerank=rerank,
                 )
             )
             tasks.append(
@@ -355,8 +429,25 @@ class Searcher:
                     mode,
                     memory_type,
                     user_name,
+                    rerank=rerank,
                 )
             )
+            if self.use_fulltext:
+                tasks.append(
+                    executor.submit(
+                        self._retrieve_from_keyword,
+                        query,
+                        parsed_goal,
+                        query_embedding,
+                        top_k,
+                        memory_type,
+                        search_filter,
+                        search_priority,
+                        user_name,
+                        id_filter,
+                        rerank=rerank,
+                    )
+                )
             if search_tool_memory:
                 tasks.append(
                     executor.submit(
@@ -371,6 +462,41 @@ class Searcher:
                         user_name,
                         id_filter,
                         mode=mode,
+                        rerank=rerank,
+                    )
+                )
+            if include_skill_memory:
+                tasks.append(
+                    executor.submit(
+                        self._retrieve_from_skill_memory,
+                        query,
+                        parsed_goal,
+                        query_embedding,
+                        skill_mem_top_k,
+                        memory_type,
+                        search_filter,
+                        search_priority,
+                        user_name,
+                        id_filter,
+                        mode=mode,
+                        rerank=rerank,
+                    )
+                )
+            if include_preference_memory:
+                tasks.append(
+                    executor.submit(
+                        self._retrieve_from_preference_memory,
+                        query,
+                        parsed_goal,
+                        query_embedding,
+                        pref_mem_top_k,
+                        memory_type,
+                        search_filter,
+                        search_priority,
+                        user_name,
+                        id_filter,
+                        mode=mode,
+                        rerank=rerank,
                     )
                 )
             results = []
@@ -393,6 +519,7 @@ class Searcher:
         search_priority: dict | None = None,
         user_name: str | None = None,
         id_filter: dict | None = None,
+        rerank: bool = True,
     ):
         """Retrieve and rerank from WorkingMemory"""
         if memory_type not in ["All", "WorkingMemory"]:
@@ -409,10 +536,199 @@ class Searcher:
             id_filter=id_filter,
             use_fast_graph=self.use_fast_graph,
         )
-        return self.reranker.rerank(
+        return self._maybe_rerank(
+            rerank,
             query=query,
-            query_embedding=query_embedding[0],
+            query_embedding=self._query_embedding_for_rerank(rerank, query_embedding),
             graph_results=items,
+            top_k=top_k,
+            parsed_goal=parsed_goal,
+            search_filter=search_filter,
+        )
+
+    @staticmethod
+    def _require_keyword_user_name(user_name: str | None) -> str:
+        normalized_user_name = user_name.strip() if isinstance(user_name, str) else ""
+        if not normalized_user_name:
+            raise ValueError(
+                "[PATH-KEYWORD] user_name is required for PolarDB fulltext keyword search"
+            )
+        return normalized_user_name
+
+    @staticmethod
+    def _is_keyword_stopword(term: str) -> bool:
+        normalized = term.strip()
+        return not normalized or StopwordManager.is_search_stopword(normalized)
+
+    @staticmethod
+    def _normalize_keyword_term(term: str) -> str:
+        normalized = str(term).strip()
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*(?:[._+\-/][A-Za-z0-9]+)*", normalized):
+            return normalized.lower()
+        return normalized
+
+    @staticmethod
+    def _keyword_extract_top_k(query: str, language: str) -> int:
+        cleaned_query = query.strip()
+        if not cleaned_query:
+            return 0
+        if len(cleaned_query) <= 12:
+            return 1
+        if language != "zh":
+            token_count = len(re.findall(r"\b[a-zA-Z0-9]+\b", cleaned_query))
+            return 2 if token_count <= 8 else KEYWORD_EXTRACT_TOP_K
+        if len(cleaned_query) <= 120:
+            return 2
+        return KEYWORD_EXTRACT_TOP_K
+
+    @classmethod
+    def _rank_english_keyword_terms(cls, terms: list[str]) -> list[str]:
+        term_stats: dict[str, dict[str, int | str]] = {}
+        for index, term in enumerate(terms):
+            normalized_term = cls._normalize_keyword_term(term)
+            if cls._is_keyword_stopword(normalized_term):
+                continue
+            key = normalized_term.lower()
+            if key not in term_stats:
+                term_stats[key] = {"term": normalized_term, "index": index, "count": 0}
+            term_stats[key]["count"] = int(term_stats[key]["count"]) + 1
+
+        def score(item: tuple[str, dict[str, int | str]]) -> tuple[float, int]:
+            _, data = item
+            term = str(data["term"])
+            count = int(data["count"])
+            term_score = count * 3.0 + min(len(term), 16) * 0.1
+            if any(ch.isdigit() for ch in term):
+                term_score += 1.0
+            if len(term) <= 2:
+                term_score -= 0.5
+            return (-term_score, int(data["index"]))
+
+        return [str(data["term"]) for _, data in sorted(term_stats.items(), key=score)]
+
+    def _extract_weighted_keyword_terms(self, query: str) -> list[str]:
+        language = detect_lang(query)
+        keyword_top_k = self._keyword_extract_top_k(query, language)
+        if keyword_top_k <= 0:
+            return []
+
+        if language == "zh":
+            jieba_analyse = importlib.import_module("jieba.analyse")
+
+            weighted_terms = jieba_analyse.extract_tags(
+                query,
+                topK=keyword_top_k,
+                allowPOS=KEYWORD_ALLOW_POS,
+            )
+        else:
+            tokenizer = self.tokenizer or FastTokenizer()
+            weighted_terms = self._rank_english_keyword_terms(tokenizer.tokenize_english(query))
+
+        query_words: list[str] = []
+        seen_words: set[str] = set()
+        for term in weighted_terms:
+            normalized_term = self._normalize_keyword_term(term)
+            dedupe_key = normalized_term.lower()
+            if self._is_keyword_stopword(normalized_term) or dedupe_key in seen_words:
+                continue
+            seen_words.add(dedupe_key)
+            query_words.append(normalized_term)
+            if len(query_words) >= keyword_top_k:
+                break
+        return query_words
+
+    @timed
+    def _retrieve_from_keyword(
+        self,
+        query,
+        parsed_goal,
+        query_embedding,
+        top_k,
+        memory_type,
+        search_filter: dict | None = None,
+        search_priority: dict | None = None,
+        user_name: str | None = None,
+        id_filter: dict | None = None,
+        rerank: bool = True,
+    ) -> list[tuple[TextualMemoryItem, float]]:
+        """Keyword/fulltext path that directly calls graph DB fulltext search."""
+
+        if memory_type not in ["All", "LongTermMemory", "UserMemory"]:
+            return []
+        if not query_embedding:
+            return []
+        user_name = self._require_keyword_user_name(user_name)
+
+        query_words = self._extract_weighted_keyword_terms(query)
+        if not query_words:
+            return []
+        # Quote weighted terms before `to_tsquery(...)` to avoid parsing operators from user input.
+        tsquery_terms = ["'" + w.replace("'", "''") + "'" for w in query_words if w and w.strip()]
+        if not tsquery_terms:
+            return []
+        logger.info(
+            "[PATH-KEYWORD] weighted query_words=%s top_k=%s user_name=%s",
+            query_words,
+            top_k,
+            user_name,
+        )
+
+        scopes = [memory_type] if memory_type != "All" else ["LongTermMemory", "UserMemory"]
+
+        id_to_score: dict[str, float] = {}
+        for scope in scopes:
+            try:
+                hits = self.graph_store.search_by_fulltext(
+                    query_words=tsquery_terms,
+                    top_k=top_k,
+                    status="activated",
+                    scope=scope,
+                    search_filter=None,
+                    filter=search_filter,
+                    user_name=user_name,
+                    tsquery_config="jiebaqry",
+                )
+            except Exception:
+                logger.warning(
+                    f"[PATH-KEYWORD] search_by_fulltext failed, scope={scope}, user_name={user_name}"
+                )
+                hits = []
+            for h in hits or []:
+                hid = str(h.get("id") or "").strip().strip("'\"")
+                if not hid:
+                    continue
+                score = h.get("score", 0.0)
+                if hid not in id_to_score or score > id_to_score[hid]:
+                    id_to_score[hid] = score
+        if not id_to_score:
+            return []
+
+        sorted_ids = sorted(id_to_score.keys(), key=lambda x: id_to_score[x], reverse=True)
+        sorted_ids = sorted_ids[:top_k]
+        node_dicts = (
+            self.graph_store.get_nodes(sorted_ids, include_embedding=True, user_name=user_name)
+            or []
+        )
+        id_to_node = {n.get("id"): n for n in node_dicts}
+        ordered_nodes = []
+
+        for rid in sorted_ids:
+            if rid in id_to_node:
+                node = copy.deepcopy(id_to_node[rid])
+                meta = node.setdefault("metadata", {})
+                meta_target = meta
+                if isinstance(meta, dict) and isinstance(meta.get("metadata"), dict):
+                    meta_target = meta["metadata"]
+                if isinstance(meta_target, dict):
+                    meta_target["keyword_score"] = id_to_score[rid]
+                ordered_nodes.append(node)
+
+        results = [TextualMemoryItem.from_dict(n) for n in ordered_nodes]
+        return self._maybe_rerank(
+            rerank,
+            query=query,
+            query_embedding=self._query_embedding_for_rerank(rerank, query_embedding),
+            graph_results=results,
             top_k=top_k,
             parsed_goal=parsed_goal,
             search_filter=search_filter,
@@ -432,6 +748,7 @@ class Searcher:
         user_name: str | None = None,
         id_filter: dict | None = None,
         mode: str = "fast",
+        rerank: bool = True,
     ):
         """Retrieve and rerank from LongTermMemory and UserMemory"""
         results = []
@@ -447,8 +764,8 @@ class Searcher:
         else:
             cot_embeddings = query_embedding
 
-        with ContextThreadPoolExecutor(max_workers=2) as executor:
-            if memory_type in ["All", "LongTermMemory"]:
+        with ContextThreadPoolExecutor(max_workers=3) as executor:
+            if memory_type in ["All", "AllSummaryMemory", "LongTermMemory"]:
                 tasks.append(
                     executor.submit(
                         self.graph_retriever.retrieve,
@@ -464,7 +781,7 @@ class Searcher:
                         use_fast_graph=self.use_fast_graph,
                     )
                 )
-            if memory_type in ["All", "UserMemory"]:
+            if memory_type in ["All", "AllSummaryMemory", "UserMemory"]:
                 tasks.append(
                     executor.submit(
                         self.graph_retriever.retrieve,
@@ -480,14 +797,33 @@ class Searcher:
                         use_fast_graph=self.use_fast_graph,
                     )
                 )
+            if memory_type in ["RawFileMemory"]:
+                tasks.append(
+                    executor.submit(
+                        self.graph_retriever.retrieve,
+                        query=query,
+                        parsed_goal=parsed_goal,
+                        query_embedding=cot_embeddings,
+                        top_k=top_k * 2,
+                        memory_scope="RawFileMemory",
+                        search_filter=search_filter,
+                        search_priority=search_priority,
+                        user_name=user_name,
+                        id_filter=id_filter,
+                        use_fast_graph=self.use_fast_graph,
+                    )
+                )
 
             # Collect results from all tasks
             for task in tasks:
                 results.extend(task.result())
+            results = self._deduplicate_rawfile_results(results, user_name=user_name)
+            results = self._filter_intermediate_content(results)
 
-        return self.reranker.rerank(
+        return self._maybe_rerank(
+            rerank,
             query=query,
-            query_embedding=query_embedding[0],
+            query_embedding=self._query_embedding_for_rerank(rerank, query_embedding),
             graph_results=results,
             top_k=top_k,
             parsed_goal=parsed_goal,
@@ -496,7 +832,13 @@ class Searcher:
 
     @timed
     def _retrieve_from_memcubes(
-        self, query, parsed_goal, query_embedding, top_k, cube_name="memos_cube01"
+        self,
+        query,
+        parsed_goal,
+        query_embedding,
+        top_k,
+        cube_name="memos_cube01",
+        rerank: bool = True,
     ):
         """Retrieve and rerank from LongTermMemory and UserMemory"""
         results = self.graph_retriever.retrieve_from_cube(
@@ -506,9 +848,10 @@ class Searcher:
             cube_name=cube_name,
             user_name=cube_name,
         )
-        return self.reranker.rerank(
+        return self._maybe_rerank(
+            rerank,
             query=query,
-            query_embedding=query_embedding[0],
+            query_embedding=self._query_embedding_for_rerank(rerank, query_embedding),
             graph_results=results,
             top_k=top_k,
             parsed_goal=parsed_goal,
@@ -526,6 +869,7 @@ class Searcher:
         mode,
         memory_type,
         user_id: str | None = None,
+        rerank: bool = True,
     ):
         """Retrieve and rerank from Internet source"""
         if not self.internet_retriever:
@@ -542,9 +886,10 @@ class Searcher:
             query=query, top_k=2 * top_k, parsed_goal=parsed_goal, info=info, mode=mode
         )
         logger.info(f"[PATH-C] '{query}' Retrieved from internet {len(items)} items: {items}")
-        return self.reranker.rerank(
+        return self._maybe_rerank(
+            rerank,
             query=query,
-            query_embedding=query_embedding[0],
+            query_embedding=self._query_embedding_for_rerank(rerank, query_embedding),
             graph_results=items,
             top_k=top_k,
             parsed_goal=parsed_goal,
@@ -564,6 +909,7 @@ class Searcher:
         user_name: str | None = None,
         id_filter: dict | None = None,
         mode: str = "fast",
+        rerank: bool = True,
     ):
         """Retrieve and rerank from ToolMemory"""
         results = {
@@ -624,23 +970,133 @@ class Searcher:
                 elif rsp and rsp[0].metadata.memory_type == "ToolTrajectoryMemory":
                     results["ToolTrajectoryMemory"].extend(rsp)
 
-        schema_reranked = self.reranker.rerank(
+        schema_reranked = self._maybe_rerank(
+            rerank,
             query=query,
-            query_embedding=query_embedding[0],
+            query_embedding=self._query_embedding_for_rerank(rerank, query_embedding),
             graph_results=results["ToolSchemaMemory"],
             top_k=top_k,
             parsed_goal=parsed_goal,
             search_filter=search_filter,
         )
-        trajectory_reranked = self.reranker.rerank(
+        trajectory_reranked = self._maybe_rerank(
+            rerank,
             query=query,
-            query_embedding=query_embedding[0],
+            query_embedding=self._query_embedding_for_rerank(rerank, query_embedding),
             graph_results=results["ToolTrajectoryMemory"],
             top_k=top_k,
             parsed_goal=parsed_goal,
             search_filter=search_filter,
         )
         return schema_reranked + trajectory_reranked
+
+    # --- Path E
+    @timed
+    def _retrieve_from_skill_memory(
+        self,
+        query,
+        parsed_goal,
+        query_embedding,
+        top_k,
+        memory_type,
+        search_filter: dict | None = None,
+        search_priority: dict | None = None,
+        user_name: str | None = None,
+        id_filter: dict | None = None,
+        mode: str = "fast",
+        rerank: bool = True,
+    ):
+        """Retrieve and rerank from SkillMemory"""
+
+        if memory_type not in ["All", "SkillMemory"]:
+            logger.info(f"[PATH-E] '{query}' Skipped (memory_type does not match)")
+            return []
+
+        # chain of thinking
+        cot_embeddings = []
+        if self.vec_cot:
+            queries = self._cot_query(query, mode=mode, context=parsed_goal.context)
+            if len(queries) > 1:
+                cot_embeddings = self.embedder.embed(queries)
+            cot_embeddings.extend(query_embedding)
+        else:
+            cot_embeddings = query_embedding
+
+        items = self.graph_retriever.retrieve(
+            query=query,
+            parsed_goal=parsed_goal,
+            query_embedding=cot_embeddings,
+            top_k=top_k * 2,
+            memory_scope="SkillMemory",
+            search_filter=search_filter,
+            search_priority=search_priority,
+            user_name=user_name,
+            id_filter=id_filter,
+            use_fast_graph=self.use_fast_graph,
+        )
+
+        return self._maybe_rerank(
+            rerank,
+            query=query,
+            query_embedding=self._query_embedding_for_rerank(rerank, query_embedding),
+            graph_results=items,
+            top_k=top_k,
+            parsed_goal=parsed_goal,
+            search_filter=search_filter,
+        )
+
+    @timed
+    def _retrieve_from_preference_memory(
+        self,
+        query,
+        parsed_goal,
+        query_embedding,
+        top_k,
+        memory_type,
+        search_filter: dict | None = None,
+        search_priority: dict | None = None,
+        user_name: str | None = None,
+        id_filter: dict | None = None,
+        mode: str = "fast",
+        rerank: bool = True,
+    ):
+        """Retrieve and rerank from PreferenceMemory"""
+        if memory_type not in ["All", "PreferenceMemory"]:
+            logger.info(f"[PATH-F] '{query}' Skipped (memory_type does not match)")
+            return []
+
+        # chain of thinking
+        cot_embeddings = []
+        if self.vec_cot:
+            queries = self._cot_query(query, mode=mode, context=parsed_goal.context)
+            if len(queries) > 1:
+                cot_embeddings = self.embedder.embed(queries)
+            cot_embeddings.extend(query_embedding)
+        else:
+            cot_embeddings = query_embedding
+
+        items = self.graph_retriever.retrieve(
+            query=query,
+            parsed_goal=parsed_goal,
+            query_embedding=cot_embeddings,
+            top_k=top_k * 2,
+            memory_scope="PreferenceMemory",
+            search_filter=search_filter,
+            search_priority=search_priority,
+            user_name=user_name,
+            id_filter=id_filter,
+            use_fast_graph=self.use_fast_graph,
+        )
+
+        return self._maybe_rerank(
+            rerank,
+            query=query,
+            query_embedding=self._query_embedding_for_rerank(rerank, query_embedding),
+            graph_results=items,
+            top_k=top_k,
+            parsed_goal=parsed_goal,
+            search_filter=search_filter,
+        )
 
     @timed
     def _retrieve_simple(
@@ -686,9 +1142,11 @@ class Searcher:
         logger.info(
             f"[SIMPLESEARCH] after unrelated subgroup selection items count: {len(selected_items)}"
         )
-        return self.reranker.rerank(
+        rerank = bool(kwargs.get("rerank", True))
+        return self._maybe_rerank(
+            rerank,
             query=query,
-            query_embedding=query_embeddings[0],
+            query_embedding=self._query_embedding_for_rerank(rerank, query_embeddings),
             graph_results=selected_items,
             top_k=top_k,
         )
@@ -704,7 +1162,16 @@ class Searcher:
 
     @timed
     def _sort_and_trim(
-        self, results, top_k, plugin=False, search_tool_memory=False, tool_mem_top_k=6
+        self,
+        results,
+        top_k,
+        plugin=False,
+        search_tool_memory=False,
+        tool_mem_top_k=6,
+        include_skill_memory=False,
+        skill_mem_top_k=3,
+        include_preference_memory=False,
+        pref_mem_top_k=6,
     ):
         """Sort results by score and trim to top_k"""
         final_items = []
@@ -749,11 +1216,57 @@ class Searcher:
                         metadata=SearchedTreeNodeTextualMemoryMetadata(**meta_data),
                     )
                 )
+
+        if include_skill_memory:
+            skill_results = [
+                (item, score)
+                for item, score in results
+                if item.metadata.memory_type == "SkillMemory"
+            ]
+            sorted_skill_results = sorted(skill_results, key=lambda pair: pair[1], reverse=True)[
+                :skill_mem_top_k
+            ]
+            for item, score in sorted_skill_results:
+                if plugin and round(score, 2) == 0.00:
+                    continue
+                meta_data = item.metadata.model_dump()
+                meta_data["relativity"] = score
+                final_items.append(
+                    TextualMemoryItem(
+                        id=item.id,
+                        memory=item.memory,
+                        metadata=SearchedTreeNodeTextualMemoryMetadata(**meta_data),
+                    )
+                )
+
+        if include_preference_memory:
+            pref_results = [
+                (item, score)
+                for item, score in results
+                if item.metadata.memory_type == "PreferenceMemory"
+            ]
+            sorted_pref_results = sorted(pref_results, key=lambda pair: pair[1], reverse=True)[
+                :pref_mem_top_k
+            ]
+            for item, score in sorted_pref_results:
+                if plugin and round(score, 2) == 0.00:
+                    continue
+                meta_data = item.metadata.model_dump()
+                meta_data["relativity"] = score
+                final_items.append(
+                    TextualMemoryItem(
+                        id=item.id,
+                        memory=item.memory,
+                        metadata=SearchedTreeNodeTextualMemoryMetadata(**meta_data),
+                    )
+                )
+
         # separate textual results
         results = [
             (item, score)
             for item, score in results
-            if item.metadata.memory_type not in ["ToolSchemaMemory", "ToolTrajectoryMemory"]
+            if item.metadata.memory_type
+            in ["WorkingMemory", "LongTermMemory", "UserMemory", "OuterMemory", "RawFileMemory"]
         ]
 
         sorted_results = sorted(results, key=lambda pair: pair[1], reverse=True)[:top_k]
@@ -771,6 +1284,66 @@ class Searcher:
                 )
             )
         return final_items
+
+    @timed
+    def _deduplicate_rawfile_results(self, results, user_name: str | None = None):
+        """
+        Deduplicate rawfile related memories by edge
+        """
+        if not results:
+            return results
+
+        summary_ids_to_remove = set()
+        rawfile_items = [item for item in results if item.metadata.memory_type == "RawFileMemory"]
+        if not rawfile_items:
+            return results
+
+        with ContextThreadPoolExecutor(max_workers=min(len(rawfile_items), 10)) as executor:
+            futures = [
+                executor.submit(
+                    self.graph_store.get_edges,
+                    rawfile_item.id,
+                    type="SUMMARY",
+                    direction="OUTGOING",
+                    user_name=user_name,
+                )
+                for rawfile_item in rawfile_items
+            ]
+            for future in as_completed(futures):
+                try:
+                    edges = future.result()
+                    for edge in edges:
+                        summary_target_id = edge.get("to")
+                        if summary_target_id:
+                            summary_ids_to_remove.add(summary_target_id)
+                            logger.debug(
+                                f"[DEDUP] Marking summary node {summary_target_id} for removal (pointed by RawFileMemory)"
+                            )
+                except Exception as e:
+                    logger.warning(f"[DEDUP] Failed to get summary target ids: {e}")
+
+        filtered_results = []
+        for item in results:
+            if item.id in summary_ids_to_remove:
+                logger.debug(
+                    f"[DEDUP] Removing summary node {item.id} because it is pointed by RawFileMemory"
+                )
+                continue
+            filtered_results.append(item)
+
+        return filtered_results
+
+    def _filter_intermediate_content(self, results):
+        """Filter intermediate content"""
+        filtered_results = []
+        for item in results:
+            if (
+                "File URL:" not in item.memory
+                and "File ID:" not in item.memory
+                and "Filename:" not in item.memory
+            ):
+                filtered_results.append(item)
+        return filtered_results
 
     @timed
     def _update_usage_history(self, items, info, user_name: str | None = None):

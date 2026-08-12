@@ -21,6 +21,7 @@ from memos.api import handlers
 from memos.api.handlers.add_handler import AddHandler
 from memos.api.handlers.base_handler import HandlerDependencies
 from memos.api.handlers.chat_handler import ChatHandler
+from memos.api.handlers.cube_handler import CubeHandler
 from memos.api.handlers.feedback_handler import FeedbackHandler
 from memos.api.handlers.search_handler import SearchHandler
 from memos.api.product_models import (
@@ -29,25 +30,34 @@ from memos.api.product_models import (
     APIChatCompleteRequest,
     APIFeedbackRequest,
     APISearchRequest,
+    ChatBusinessRequest,
     ChatPlaygroundRequest,
     ChatRequest,
+    CreateCubeRequest,
+    CreateCubeResponse,
+    DeleteMemoryByRecordIdRequest,
+    DeleteMemoryByRecordIdResponse,
     DeleteMemoryRequest,
     DeleteMemoryResponse,
     ExistMemCubeIdRequest,
     ExistMemCubeIdResponse,
+    GetMemoryDashboardRequest,
     GetMemoryPlaygroundRequest,
     GetMemoryRequest,
     GetMemoryResponse,
     GetUserNamesByMemoryIdsRequest,
     GetUserNamesByMemoryIdsResponse,
     MemoryResponse,
+    RecoverMemoryByRecordIdRequest,
+    RecoverMemoryByRecordIdResponse,
+    RegisterCubeRequest,
+    RegisterCubeResponse,
     SearchResponse,
     StatusResponse,
     SuggestionRequest,
     SuggestionResponse,
     TaskQueueResponse,
 )
-from memos.graph_dbs.polardb import PolarDBGraphDB
 from memos.log import get_logger
 from memos.mem_scheduler.base_scheduler import BaseScheduler
 from memos.mem_scheduler.utils.status_tracker import TaskStatusTracker
@@ -71,16 +81,18 @@ search_handler = SearchHandler(dependencies)
 add_handler = AddHandler(dependencies)
 chat_handler = (
     ChatHandler(
-        dependencies,
-        components["chat_llms"],
-        search_handler,
-        add_handler,
+        dependencies=dependencies,
+        chat_llms=components["chat_llms"],
+        playground_chat_llms=components.get("playground_chat_llms"),
+        search_handler=search_handler,
+        add_handler=add_handler,
         online_bot=components.get("online_bot"),
     )
     if os.getenv("ENABLE_CHAT_API", "false") == "true"
     else None
 )
 feedback_handler = FeedbackHandler(dependencies)
+cube_handler = CubeHandler(dependencies)
 # Extract commonly used components for function-based handlers
 # (These can be accessed from the components dict without unpacking all of them)
 mem_scheduler: BaseScheduler = components["mem_scheduler"]
@@ -89,7 +101,6 @@ naive_mem_cube = components["naive_mem_cube"]
 redis_client = components["redis_client"]
 status_tracker = TaskStatusTracker(redis_client=redis_client)
 graph_db = components["graph_db"]
-vector_db = components["vector_db"]
 
 
 # =============================================================================
@@ -121,6 +132,57 @@ def add_memories(add_req: APIADDRequest):
     This endpoint uses the class-based AddHandler for better code organization.
     """
     return add_handler.handle_add_memories(add_req)
+
+
+# =============================================================================
+# Cube Management API Endpoints
+# =============================================================================
+
+
+@router.post("/create_cube", summary="Create a new memory cube", response_model=CreateCubeResponse)
+async def create_cube(request: CreateCubeRequest) -> CreateCubeResponse:
+    """
+    Create a new memory cube for a user.
+
+    Memory cubes are containers that store different types of memories (textual, activation, parametric).
+    Each cube can be owned by a user and shared with other users.
+
+    **Note on cube_id vs mem_cube_id:**
+    These terms are used interchangeably throughout the API:
+    - `cube_id` is the canonical identifier for a cube
+    - `mem_cube_id` appears in many legacy endpoints and means the same thing
+    - When using other endpoints (search, add, chat), you can reference this cube using either term
+
+    **Semantic Clarification:**
+    - **Single mem_cube_id** (deprecated): Used in older endpoints to identify a single cube.
+      New code should use `readable_cube_ids` / `writable_cube_ids` lists instead.
+    - **readable_cube_ids**: List of cube IDs the user can read from (used in search/chat)
+    - **writable_cube_ids**: List of cube IDs the user can write to (used in add/chat)
+    """
+    return await cube_handler.create_cube(request)
+
+
+@router.post(
+    "/register_cube",
+    summary="Register an existing memory cube",
+    response_model=RegisterCubeResponse,
+)
+async def register_cube(request: RegisterCubeRequest) -> RegisterCubeResponse:
+    """
+    Register an existing memory cube with the MOS system.
+
+    This method loads and registers a memory cube from a file path or creates a new one
+    if the path doesn't exist. The cube becomes available for memory operations.
+
+    **Note on cube_id vs mem_cube_id:**
+    These terms are used interchangeably throughout the API. The registered cube can then
+    be referenced by its cube_id/mem_cube_id in other endpoints.
+
+    **Current Status:**
+    This endpoint validates the registration request. Full registration functionality
+    requires architectural integration with MOSCore, which will be completed in a future update.
+    """
+    return await cube_handler.register_cube(request)
 
 
 # =============================================================================
@@ -290,8 +352,9 @@ def get_all_memories(memory_req: GetMemoryPlaygroundRequest):
                 memory_req.mem_cube_ids[0] if memory_req.mem_cube_ids else memory_req.user_id
             ),
             query=memory_req.search_query,
-            top_k=20,
+            top_k=200,
             naive_mem_cube=naive_mem_cube,
+            search_type=memory_req.search_type,
         )
     else:
         return handlers.memory_handler.handle_get_all_memories(
@@ -316,6 +379,14 @@ def get_memories(memory_req: GetMemoryRequest):
 def get_memory_by_id(memory_id: str):
     return handlers.memory_handler.handle_get_memory(
         memory_id=memory_id,
+        naive_mem_cube=naive_mem_cube,
+    )
+
+
+@router.post("/get_memory_by_ids", summary="Get memory by ids", response_model=GetMemoryResponse)
+def get_memory_by_ids(memory_ids: list[str]):
+    return handlers.memory_handler.handle_get_memory_by_ids(
+        memory_ids=memory_ids,
         naive_mem_cube=naive_mem_cube,
     )
 
@@ -355,24 +426,9 @@ def feedback_memories(feedback_req: APIFeedbackRequest):
     response_model=GetUserNamesByMemoryIdsResponse,
 )
 def get_user_names_by_memory_ids(request: GetUserNamesByMemoryIdsRequest):
-    """Get user names by memory ids."""
-    if not isinstance(graph_db, PolarDBGraphDB):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "graph_db must be an instance of PolarDBGraphDB to use "
-                "get_user_names_by_memory_ids"
-                f"current graph_db is: {graph_db.__class__.__name__}"
-            ),
-        )
+    """Get user names by memory ids. Now unified to query from graph_db only."""
     result = graph_db.get_user_names_by_memory_ids(memory_ids=request.memory_ids)
-    if vector_db:
-        prefs = []
-        for collection_name in ["explicit_preference", "implicit_preference"]:
-            prefs.extend(
-                vector_db.get_by_ids(collection_name=collection_name, ids=request.memory_ids)
-            )
-        result.update({pref.id: pref.payload.get("mem_cube_id", None) for pref in prefs})
+
     return GetUserNamesByMemoryIdsResponse(
         code=200,
         message="Successfully",
@@ -386,9 +442,69 @@ def get_user_names_by_memory_ids(request: GetUserNamesByMemoryIdsRequest):
     response_model=ExistMemCubeIdResponse,
 )
 def exist_mem_cube_id(request: ExistMemCubeIdRequest):
-    """Check if mem cube id exists."""
+    """(inner) Check if mem cube id exists."""
     return ExistMemCubeIdResponse(
         code=200,
         message="Successfully",
         data=graph_db.exist_user_name(user_name=request.mem_cube_id),
+    )
+
+
+@router.post("/chat/stream/business_user", summary="Chat with MemOS for business user")
+def chat_stream_business_user(chat_req: ChatBusinessRequest):
+    """(inner) Chat with MemOS for a specific business user. Returns SSE stream."""
+    if chat_handler is None:
+        raise HTTPException(
+            status_code=503, detail="Chat service is not available. Chat handler not initialized."
+        )
+
+    return chat_handler.handle_chat_stream_for_business_user(chat_req)
+
+
+@router.post(
+    "/delete_memory_by_record_id",
+    summary="Delete memory by record id",
+    response_model=DeleteMemoryByRecordIdResponse,
+)
+def delete_memory_by_record_id(memory_req: DeleteMemoryByRecordIdRequest):
+    """(inner) Delete memory nodes by mem_cube_id (user_name) and delete_record_id. Record id is inner field, just for delete and recover memory, not for user to set."""
+    graph_db.delete_node_by_mem_cube_id(
+        mem_cube_id=memory_req.mem_cube_id,
+        delete_record_id=memory_req.record_id,
+        hard_delete=memory_req.hard_delete,
+    )
+
+    return DeleteMemoryByRecordIdResponse(
+        code=200,
+        message="Called Successfully",
+        data={"status": "success"},
+    )
+
+
+@router.post(
+    "/recover_memory_by_record_id",
+    summary="Recover memory by record id",
+    response_model=RecoverMemoryByRecordIdResponse,
+)
+def recover_memory_by_record_id(memory_req: RecoverMemoryByRecordIdRequest):
+    """(inner) Recover memory nodes by mem_cube_id (user_name) and delete_record_id. Record id is inner field, just for delete and recover memory, not for user to set."""
+    graph_db.recover_memory_by_mem_cube_id(
+        mem_cube_id=memory_req.mem_cube_id,
+        delete_record_id=memory_req.delete_record_id,
+    )
+
+    return RecoverMemoryByRecordIdResponse(
+        code=200,
+        message="Called Successfully",
+        data={"status": "success"},
+    )
+
+
+@router.post(
+    "/get_memory_dashboard", summary="Get memories for dashboard", response_model=GetMemoryResponse
+)
+def get_memories_dashboard(memory_req: GetMemoryDashboardRequest):
+    return handlers.memory_handler.handle_get_memories_dashboard(
+        get_mem_req=memory_req,
+        naive_mem_cube=naive_mem_cube,
     )

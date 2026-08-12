@@ -244,12 +244,17 @@ Please perform:
 
 Return a single valid JSON object with the following structure:
 
-Return valid JSON:
 {
-  "key": <string, a concise title of the `value` field>,
-  "memory_type": "LongTermMemory",
-  "value": <A clear and accurate paragraph that comprehensively summarizes the main points, arguments, and information within the document chunk — written in English if the input memory items are in English, or in Chinese if the input is in Chinese>,
-  "tags": <A list of relevant thematic keywords (e.g., ["deadline", "team", "planning"])>
+  "memory list": [
+    {
+      "key": <string, a concise title of the `value` field>,
+      "memory_type": "LongTermMemory",
+      "value": <A clear and accurate paragraph that comprehensively summarizes the main points, arguments, and information within the document chunk — written in English if the input memory items are in English, or in Chinese if the input is in Chinese>,
+      "tags": <A list of relevant thematic keywords (e.g., ["deadline", "team", "planning"])>
+    }
+    ...
+  ],
+  "summary": <a concise summary of the document chunk>
 }
 
 Language rules:
@@ -258,13 +263,17 @@ Language rules:
 
 {custom_tags_prompt}
 
+If given context, use it as a supplement to the document information extraction; if no context is given, directly process the document information.
+Reference context:
+{context}
+
 Document chunk:
 {chunk_text}
 
 Your Output:"""
 
 SIMPLE_STRUCT_DOC_READER_PROMPT_ZH = """您是搜索与检索系统的文本分析专家。
-您的任务是处理文档片段，并生成一个结构化的 JSON 对象。
+您的任务是处理文档片段，并生成一个结构化的 JSON 列表对象。
 
 请执行以下操作：
 1. 识别反映文档中事实内容、见解、决策或含义的关键信息——包括任何显著的主题、结论或数据点，使读者无需阅读原文即可充分理解该片段的核心内容。
@@ -281,14 +290,19 @@ SIMPLE_STRUCT_DOC_READER_PROMPT_ZH = """您是搜索与检索系统的文本分�
    - 优先考虑完整性和保真度，而非简洁性。
    - 不要泛化或跳过可能具有上下文意义的细节。
 
-返回一个有效的 JSON 对象，结构如下：
+返回有效的 JSON 对象：
 
-返回有效的 JSON：
 {
-  "key": <字符串，`value` 字段的简洁标题>,
-  "memory_type": "LongTermMemory",
-  "value": <一段清晰准确的段落，全面总结文档片段中的主要观点、论据和信息——若输入摘要为英文，则用英文；若为中文，则用中文>,
-  "tags": <相关主题关键词列表（例如，["截止日期", "团队", "计划"]）>
+  "memory list": [
+    {
+      "key": <字符串，`value` 字段的简洁标题>,
+      "memory_type": "LongTermMemory",
+      "value": <一段清晰准确的段落，全面总结文档片段中的主要观点、论据和信息——若输入摘要为英文，则用英文；若为中文，则用中文>,
+      "tags": <相关主题关键词列表（例如，["截止日期", "团队", "计划"]）>
+    }
+    ...
+  ],
+  "summary": <简洁总结原文内容，与输入语言一致>
 }
 
 语言规则：
@@ -296,6 +310,10 @@ SIMPLE_STRUCT_DOC_READER_PROMPT_ZH = """您是搜索与检索系统的文本分�
 - `memory_type` 保持英文。
 
 {custom_tags_prompt}
+
+如果给定了上下文，就结合上下文信息作为文档信息提取的补充，如果没有给定上下文，请直接处理文档信息。
+参考的上下文：
+{context}
 
 示例：
 输入的文本片段：
@@ -604,13 +622,12 @@ CUSTOM_TAGS_INSTRUCTION_ZH = """输出tags可以参考下列标签：
 你可以选择与memory相关的在上述列表中可以加入tags，同时你可以根据memory的内容自由添加tags。"""
 
 
-IMAGE_ANALYSIS_PROMPT_EN = """You are an intelligent memory assistant. Analyze the provided image and extract meaningful information that should be remembered.
+IMAGE_ANALYSIS_PROMPT_EN = """You are an intelligent memory assistant. Please analyze the provided image based on the contextual information (if any) and extract meaningful information that should be remembered.
 
 Please extract:
 1. **Visual Content**: What objects, people, scenes, or text are visible in the image?
-2. **Context**: What is the context or situation depicted?
-3. **Key Information**: What important details, facts, or information can be extracted?
-4. **User Relevance**: What aspects of this image might be relevant to the user's memory?
+2. **Key Information**: What important details, facts, or information can be extracted?
+3. **User Relevance**: What aspects of this image might be relevant to the user's memory?
 
 Return a valid JSON object with the following structure:
 {
@@ -630,16 +647,44 @@ Language rules:
 - The `key`, `value`, `tags`, `summary` and `memory_type` fields should match the language of the user's context if available, otherwise use English.
 - Keep `memory_type` in English.
 
+Example:
+Reference context:
+role-user: I plan to carry this for hiking at Mount Siguniang
+role-Bob: Me too
+
+Image URL to be analyzed: https://xxxxxx.jpg
+{
+  "memory list": [
+    {
+      "key": "Cylindrical Carry-On Item Attached to Hiking Backpack",
+      "memory_type": "LongTermMemory",
+      "value": "An outdoor hiking backpack has a black cylindrical carry-on item secured to its side with webbing straps. The cylinder is positioned vertically, with a length close to the height of the backpack’s side pocket. The exterior is dark-colored with a textured or perforated surface, clearly designed for outdoor use and convenient access while walking.",
+      "tags": ["outdoor", "hiking", "backpack", "side-mounted", "carry-on item"]
+    },
+    {
+      "key": "Mount Siguniang Hiking Equipment Plan",
+      "memory_type": "UserMemory",
+      "value": "Both the user and Bob explicitly plan to carry this outdoor backpack during their hiking trip to Mount Siguniang, indicating that this carrying setup has been included in their preparation for a high-altitude hiking journey.",
+      "tags": ["user plan", "Mount Siguniang", "hiking", "trekking trip"]
+    }
+  ],
+  "summary": "The image presents a typical hiking setup in an outdoor context. A hiking or travel backpack has a black cylindrical carry-on item attached to its side, suggesting a lightweight and practical configuration for long-distance walking. The overall visual tone emphasizes mobility and convenience. The accompanying text highlights ease of travel, no installation required, and suitability for carrying while on the move. Clear specifications for the cylindrical item are also shown, including its width (approximately 2.56 inches), height (approximately 9.76 inches), and net weight (about 1.45 pounds), underscoring its compact size and manageable weight. Combined with the provided context, this setup is planned for a hiking trip to Mount Siguniang, giving the image a clear personal usage scenario and long-term memory relevance."
+}
+
+If context is provided, incorporate it into the extraction. If no context is given, extract only the key information from the image.
+
+Reference context:
+{context}
+
 Focus on extracting factual, observable information from the image. Avoid speculation unless clearly relevant to user memory."""
 
 
-IMAGE_ANALYSIS_PROMPT_ZH = """您是一个智能记忆助手。请分析提供的图像并提取应该被记住的有意义信息。
+IMAGE_ANALYSIS_PROMPT_ZH = """您是一个智能记忆助手。请根据上下文信息（如有）分析提供的图像并提取应该被记住的有意义信息。
 
 请提取：
 1. **视觉内容**：图像中可见的物体、人物、场景或文字是什么？
-2. **上下文**：图像描绘了什么情境或情况？
-3. **关键信息**：可以提取哪些重要的细节、事实或信息？
-4. **用户相关性**：图像的哪些方面可能与用户的记忆相关？
+2. **关键信息**：可以提取哪些重要的细节、事实或信息？
+3. **用户相关性**：图像的哪些方面可能与用户的记忆相关？
 
 返回一个有效的 JSON 对象，格式如下：
 {
@@ -659,7 +704,36 @@ IMAGE_ANALYSIS_PROMPT_ZH = """您是一个智能记忆助手。请分析提供�
 - `key`、`value`、`tags`、`summary` 和 `memory_type` 字段应该与用户上下文的语言匹配（如果可用），否则使用中文。
 - `memory_type` 保持英文。
 
-专注于从图像中提取事实性、可观察的信息。除非与用户记忆明显相关，否则避免推测。"""
+例子：
+参考的上下文：
+role-user: 我打算背这个去四姑娘山徒步
+role-bob: 我也是
+
+待解析的url：https://xxxxxx.jpg
+{
+  "memory list": [
+    {
+      "key": "徒步背包侧挂圆柱形随行物品",
+      "memory_type": "LongTermMemory",
+      "value": "一只户外徒步背包侧面通过织带固定了一件黑色圆柱形随行物品。圆柱体纵向放置，长度接近背包侧袋高度，外壳为深色并带有防滑或透气纹理，整体外观明显为户外使用设计，方便在行走过程中快速取放。",
+      "tags": ["户外", "徒步", "背包", "侧挂", "随行物品"]
+    },
+    {
+      "key": "四姑娘山徒步随身装备计划",
+      "memory_type": "UserMemory",
+      "value": "用户和Bob明确计划在四姑娘山徒步行程中背负该款户外背包，说明这套背负方式已被纳入他们高海拔徒步行程的装备准备中。",
+      "tags": ["用户计划", "四姑娘山", "徒步", "登山行程"]
+    }
+  ],
+  "summary": "画面展示了一种典型的徒步出行配置：一只登山或旅行背包侧边固定着一件黑色圆柱形随行物品，整体氛围明显指向户外行走和轻量化携带场景。画面中的文字强调轻便、无需安装、适合随身携带的使用理念，并直接给出了随行物品的尺寸与重量信息（宽度约2.56英寸、高度约9.76英寸、净重约1.45磅），突出了便于背负和长时间携行的特点。结合用户给出的背景，这套装备被计划用于四姑娘山徒步，具备清晰的个人使用情境和长期记忆价值。"
+}
+
+如果给定了上下文，就结合上下文信息进行提取，如果没有给定上下文，请直接提取图片的关键信息。
+参考的上下文：
+{context}
+
+专注于从图像中提取事实性、可观察的信息。除非与用户记忆明显相关，否则避免推测。
+"""
 
 
 SIMPLE_STRUCT_REWRITE_MEMORY_PROMPT_BACKUP = """

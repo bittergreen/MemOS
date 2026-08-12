@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 from memos.context.context import ContextThreadPoolExecutor
 from memos.multi_mem_cube.views import MemCubeView
+from memos.utils import timed_stage
 
 
 if TYPE_CHECKING:
@@ -27,13 +28,18 @@ class CompositeCubeView(MemCubeView):
 
     def add_memories(self, add_req: APIADDRequest) -> list[dict[str, Any]]:
         all_results: list[dict[str, Any]] = []
+        cube_count = len(self.cube_views)
 
-        # fast mode: for each cube view, add memories
-        # maybe add more strategies in add_req.async_mode
-        for view in self.cube_views:
-            self.logger.info(f"[CompositeCubeView] fan-out add to cube={view.cube_id}")
-            results = view.add_memories(add_req)
-            all_results.extend(results)
+        with timed_stage("add", "multi_cube", cube_count=cube_count):
+            for idx, view in enumerate(self.cube_views):
+                self.logger.info(
+                    "[CompositeCubeView] fan-out add to cube=%s (%d/%d)",
+                    view.cube_id,
+                    idx + 1,
+                    cube_count,
+                )
+                results = view.add_memories(add_req)
+                all_results.extend(results)
 
         return all_results
 
@@ -46,6 +52,7 @@ class CompositeCubeView(MemCubeView):
             "pref_mem": [],
             "pref_note": "",
             "tool_mem": [],
+            "skill_mem": [],
         }
 
         def _search_single_cube(view: SingleCubeView) -> dict[str, Any]:
@@ -65,7 +72,7 @@ class CompositeCubeView(MemCubeView):
                 merged_results["para_mem"].extend(cube_result.get("para_mem", []))
                 merged_results["pref_mem"].extend(cube_result.get("pref_mem", []))
                 merged_results["tool_mem"].extend(cube_result.get("tool_mem", []))
-
+                merged_results["skill_mem"].extend(cube_result.get("skill_mem", []))
                 note = cube_result.get("pref_note")
                 if note:
                     if merged_results["pref_note"]:

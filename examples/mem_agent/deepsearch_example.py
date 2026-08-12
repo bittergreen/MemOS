@@ -47,7 +47,7 @@ def build_minimal_components():
 
     # Build component configurations using APIConfig methods (like config_builders.py)
 
-    # Graph DB configuration - using APIConfig.get_nebular_config()
+    # Graph DB configuration - using APIConfig graph DB helpers
     graph_db_backend = os.getenv("NEO4J_BACKEND", "polardb").lower()
     graph_db_backend_map = {
         "polardb": APIConfig.get_polardb_config(),
@@ -179,7 +179,7 @@ def factory_initialization() -> tuple[DeepSearchMemAgent, dict[str, Any]]:
 
 
 def main():
-    agent_factory, components_factory = factory_initialization()
+    agent_factory, _components_factory = factory_initialization()
     results = agent_factory.run(
         "Caroline met up with friends, family, and mentors in early July 2023.",
         user_id="locomo_exp_user_0_speaker_b_ct-1118",

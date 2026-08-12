@@ -3,7 +3,7 @@
 import json
 import re
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from memos.embedders.base import BaseEmbedder
 from memos.llms.base import BaseLLM
@@ -18,6 +18,10 @@ from memos.types.openai_chat_completion_types import ChatCompletionContentPartIm
 
 from .base import BaseMessageParser, _derive_key
 from .utils import detect_lang
+
+
+if TYPE_CHECKING:
+    from memos.types.general_types import UserContext
 
 
 logger = get_logger(__name__)
@@ -47,15 +51,23 @@ class ImageParser(BaseMessageParser):
             if isinstance(image_url, dict):
                 url = image_url.get("url", "")
                 detail = image_url.get("detail", "auto")
+                image_info = image_url
+                return SourceMessage(
+                    type="image",
+                    content=url,
+                    url=url,
+                    detail=detail,
+                    image_info=image_info,
+                )
             else:
                 url = str(image_url)
                 detail = "auto"
-            return SourceMessage(
-                type="image",
-                content=url,
-                url=url,
-                detail=detail,
-            )
+                return SourceMessage(
+                    type="image",
+                    content=url,
+                    url=url,
+                    detail=detail,
+                )
         return SourceMessage(type="image", content=str(message))
 
     def rebuild_from_source(
@@ -70,11 +82,16 @@ class ImageParser(BaseMessageParser):
             or (source.content or "").replace("[image_url]: ", "")
         )
         detail = getattr(source, "detail", "auto")
+        image_id = ""
+        image_info = source.image_info
+        if image_info and isinstance(image_info, dict):
+            image_id = image_info.get("image_id")
         return {
             "type": "image_url",
             "image_url": {
                 "url": url,
                 "detail": detail,
+                "image_id": str(image_id),
             },
         }
 
@@ -84,10 +101,43 @@ class ImageParser(BaseMessageParser):
         info: dict[str, Any],
         **kwargs,
     ) -> list[TextualMemoryItem]:
-        """Parse image_url in fast mode - returns empty list as images need fine mode processing."""
-        # In fast mode, images are not processed (they need vision models)
-        # They will be processed in fine mode via process_transfer
-        return []
+        """Parse image_url in fast mode by preserving the source for fine mode."""
+        if not isinstance(message, dict):
+            logger.warning(f"[ImageParser] Expected dict, got {type(message)}")
+            return []
+
+        source = self.create_source(message, info)
+        url = getattr(source, "url", None) or getattr(source, "content", "")
+        if not url:
+            logger.warning("[ImageParser] No image URL found in fast mode message")
+            return []
+
+        info_ = info.copy()
+        user_id = info_.pop("user_id", "")
+        session_id = info_.pop("session_id", "")
+        content = f"[image_url]: {url}"
+        need_emb = kwargs.get("need_emb", True)
+
+        return [
+            TextualMemoryItem(
+                memory=content,
+                metadata=TreeNodeTextualMemoryMetadata(
+                    user_id=user_id,
+                    session_id=session_id,
+                    memory_type="UserMemory",
+                    status="activated",
+                    tags=["mode:fast", "multimodal:image"],
+                    key=_derive_key(content),
+                    embedding=self.embedder.embed([content])[0] if need_emb else None,
+                    usage=[],
+                    sources=[source],
+                    background="",
+                    confidence=0.99,
+                    type="fact",
+                    info=info_,
+                ),
+            )
+        ]
 
     def parse_fine(
         self,
@@ -133,13 +183,14 @@ class ImageParser(BaseMessageParser):
         # Get context items if available
         context_items = kwargs.get("context_items")
 
-        # Determine language: prioritize lang from source (passed via kwargs),
-        # fallback to detecting from context_items if lang not provided
+        # Determine language: prioritize lang from context_items,
+        # fallback to kwargs
         lang = kwargs.get("lang")
-        if lang is None and context_items:
+        if context_items:
             for item in context_items:
                 if hasattr(item, "memory") and item.memory:
                     lang = detect_lang(item.memory)
+                    source.lang = lang
                     break
         if not lang:
             lang = "en"
@@ -150,6 +201,17 @@ class ImageParser(BaseMessageParser):
         image_analysis_prompt = (
             IMAGE_ANALYSIS_PROMPT_ZH if lang == "zh" else IMAGE_ANALYSIS_PROMPT_EN
         )
+
+        # Add context if available
+        context_text = ""
+        if context_items:
+            for item in context_items:
+                if hasattr(item, "memory") and item.memory:
+                    context_text += f"{item.memory}\n"
+        context_text = context_text.strip()
+
+        # Inject context into prompt when possible
+        image_analysis_prompt = image_analysis_prompt.replace("{context}", context_text)
 
         # Build messages with image content
         messages = [
@@ -168,21 +230,6 @@ class ImageParser(BaseMessageParser):
             }
         ]
 
-        # Add context if available
-        if context_items:
-            context_text = ""
-            for item in context_items:
-                if hasattr(item, "memory") and item.memory:
-                    context_text += f"{item.memory}\n"
-            if context_text:
-                messages.insert(
-                    0,
-                    {
-                        "role": "system",
-                        "content": f"Context from previous conversation:\n{context_text}",
-                    },
-                )
-
         try:
             # Call LLM with vision model
             response_text = self.llm.generate(messages)
@@ -192,6 +239,9 @@ class ImageParser(BaseMessageParser):
 
             # Parse JSON response
             response_json = self._parse_json_result(response_text)
+            if not response_json:
+                logger.warning(f"[ImageParser] Fail to parse response from LLM: {response_text}")
+                return []
 
             # Extract memory items from response
             memory_items = []
@@ -213,6 +263,7 @@ class ImageParser(BaseMessageParser):
                             key=_derive_key(summary),
                             sources=[source],
                             background=summary,
+                            **kwargs,
                         )
                     )
                 return memory_items
@@ -253,6 +304,7 @@ class ImageParser(BaseMessageParser):
                         key=key if key else _derive_key(value),
                         sources=[source],
                         background=background,
+                        **kwargs,
                     )
                     memory_items.append(memory_item)
                 except Exception as e:
@@ -274,6 +326,7 @@ class ImageParser(BaseMessageParser):
                     key=_derive_key(fallback_value),
                     sources=[source],
                     background="Image processing encountered an error.",
+                    **kwargs,
                 )
             ]
 
@@ -323,8 +376,7 @@ class ImageParser(BaseMessageParser):
                     return json.loads(s)
                 except json.JSONDecodeError:
                     pass
-            logger.error(f"[ImageParser] Failed to parse JSON: {e}\nResponse: {response_text}")
-            return {}
+            logger.warning(f"[ImageParser] Failed to parse JSON: {e}\nResponse: {response_text}")
 
     def _create_memory_item(
         self,
@@ -335,11 +387,17 @@ class ImageParser(BaseMessageParser):
         key: str,
         sources: list[SourceMessage],
         background: str = "",
+        **kwargs,
     ) -> TextualMemoryItem:
         """Create a TextualMemoryItem with the given parameters."""
         info_ = info.copy()
         user_id = info_.pop("user_id", "")
         session_id = info_.pop("session_id", "")
+
+        # Extract manager_user_id and project_id from user_context
+        user_context: UserContext | None = kwargs.get("user_context")
+        manager_user_id = user_context.manager_user_id if user_context else None
+        project_id = user_context.project_id if user_context else None
 
         return TextualMemoryItem(
             memory=value,
@@ -357,5 +415,7 @@ class ImageParser(BaseMessageParser):
                 confidence=0.99,
                 type="fact",
                 info=info_,
+                manager_user_id=manager_user_id,
+                project_id=project_id,
             ),
         )

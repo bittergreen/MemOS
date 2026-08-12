@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
@@ -24,7 +24,18 @@ class BaseMemReaderConfig(BaseConfig):
             return datetime.fromisoformat(value.replace("Z", "+00:00"))
         return value
 
-    llm: LLMConfigFactory = Field(..., description="LLM configuration for the MemReader")
+    llm: LLMConfigFactory = Field(
+        ..., description="LLM configuration for chat/doc memory extraction (fine-tuned model)"
+    )
+    general_llm: LLMConfigFactory | None = Field(
+        default=None,
+        description="General LLM for non-chat/doc tasks: hallucination filter, memory rewrite, "
+        "memory merge, tool trajectory, skill memory. Falls back to main llm if not set.",
+    )
+    image_parser_llm: LLMConfigFactory | None = Field(
+        default=None,
+        description="Vision LLM for image parsing. Falls back to general_llm if not set.",
+    )
     embedder: EmbedderConfigFactory = Field(
         ..., description="Embedder configuration for the MemReader"
     )
@@ -56,6 +67,22 @@ class MultiModalStructMemReaderConfig(BaseMemReaderConfig):
         description="List of hostnames that should return markdown directly without parsing. "
         "If None, reads from FILE_PARSER_DIRECT_MARKDOWN_HOSTNAMES environment variable.",
     )
+
+    oss_config: dict[str, Any] | None = Field(
+        default=None,
+        description="OSS configuration for the MemReader",
+    )
+    skills_dir_config: dict[str, Any] | None = Field(
+        default=None,
+        description="Skills directory for the MemReader",
+    )
+    memory_version_switch: Literal["on", "off"] = Field(
+        default="off",
+        description="Turn on memory version or off",
+    )
+
+    # Allow passing additional fields without raising validation errors
+    model_config = ConfigDict(extra="allow", strict=True)
 
 
 class StrategyStructMemReaderConfig(BaseMemReaderConfig):

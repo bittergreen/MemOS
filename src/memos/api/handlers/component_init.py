@@ -18,11 +18,8 @@ from memos.api.handlers.config_builders import (
     build_internet_retriever_config,
     build_llm_config,
     build_mem_reader_config,
-    build_pref_adder_config,
-    build_pref_extractor_config,
-    build_pref_retriever_config,
+    build_nli_client_config,
     build_reranker_config,
-    build_vec_db_config,
 )
 from memos.configs.mem_scheduler import SchedulerConfigFactory
 from memos.embedders.factory import EmbedderFactory
@@ -31,19 +28,14 @@ from memos.llms.factory import LLMFactory
 from memos.log import get_logger
 from memos.mem_cube.navie import NaiveMemCube
 from memos.mem_feedback.simple_feedback import SimpleMemFeedback
-from memos.mem_os.product_server import MOSServer
 from memos.mem_reader.factory import MemReaderFactory
 from memos.mem_scheduler.orm_modules.base_model import BaseDBManager
 from memos.mem_scheduler.scheduler_factory import SchedulerFactory
-from memos.memories.textual.prefer_text_memory.factory import (
-    AdderFactory,
-    ExtractorFactory,
-    RetrieverFactory,
-)
-from memos.memories.textual.simple_preference import SimplePreferenceTextMemory
 from memos.memories.textual.simple_tree import SimpleTreeTextMemory
 from memos.memories.textual.tree_text_memory.organize.manager import MemoryManager
 from memos.memories.textual.tree_text_memory.retrieve.retrieve_utils import FastTokenizer
+from memos.plugins.component_bootstrap import build_plugin_context
+from memos.plugins.manager import plugin_manager
 
 
 if TYPE_CHECKING:
@@ -53,7 +45,6 @@ from memos.memories.textual.tree_text_memory.retrieve.internet_retriever_factory
     InternetRetrieverFactory,
 )
 from memos.reranker.factory import RerankerFactory
-from memos.vec_dbs.factory import VecDBFactory
 
 
 if TYPE_CHECKING:
@@ -122,7 +113,7 @@ def init_server() -> dict[str, Any]:
     required by the MemOS server, including:
     - Database connections (graph DB, vector DB)
     - Language models and embedders
-    - Memory systems (text, preference)
+    - Memory systems (text)
     - Scheduler and related modules
 
     Returns:
@@ -131,21 +122,30 @@ def init_server() -> dict[str, Any]:
         existing code that uses the components.
     """
     logger.info("Initializing MemOS server components...")
+    logger.info(
+        "[INIT_SERVER] env_MEMSCHEDULER_STREAM_KEY_PREFIX=%s, env_MEMSCHEDULER_REDIS_STREAM_KEY_PREFIX=%s, env_POLAR_DB_DB_NAME=%s",
+        os.getenv("MEMSCHEDULER_STREAM_KEY_PREFIX"),
+        os.getenv("MEMSCHEDULER_REDIS_STREAM_KEY_PREFIX"),
+        os.getenv("POLAR_DB_DB_NAME"),
+    )
 
     # Initialize Redis client first as it is a core dependency for features like scheduler status tracking
-    try:
-        from memos.mem_scheduler.orm_modules.api_redis_model import APIRedisDBManager
+    if os.getenv("MEMSCHEDULER_USE_REDIS_QUEUE", "False").lower() == "true":
+        try:
+            from memos.mem_scheduler.orm_modules.api_redis_model import APIRedisDBManager
 
-        redis_client = APIRedisDBManager.load_redis_engine_from_env()
-        if redis_client:
-            logger.info("Redis client initialized successfully.")
-        else:
-            logger.error(
-                "Failed to initialize Redis client. Check REDIS_HOST etc. in environment variables."
-            )
-    except Exception as e:
-        logger.error(f"Failed to initialize Redis client: {e}", exc_info=True)
-        redis_client = None  # Ensure redis_client exists even on failure
+            redis_client = APIRedisDBManager.load_redis_engine_from_env()
+            if redis_client:
+                logger.info("Redis client initialized successfully.")
+            else:
+                logger.error(
+                    "Failed to initialize Redis client. Check REDIS_HOST etc. in environment variables."
+                )
+        except Exception as e:
+            logger.error(f"Failed to initialize Redis client: {e}", exc_info=True)
+            redis_client = None  # Ensure redis_client exists even on failure
+    else:
+        redis_client = None
 
     # Get default cube configuration
     default_cube_config = APIConfig.get_default_cube_config()
@@ -157,34 +157,50 @@ def init_server() -> dict[str, Any]:
     graph_db_config = build_graph_db_config()
     llm_config = build_llm_config()
     chat_llm_config = build_chat_llm_config()
+    playground_chat_llm_config = build_chat_llm_config("PLAYGROUND_CHAT_MODEL_LIST")
     embedder_config = build_embedder_config()
+    nli_client_config = build_nli_client_config()
     mem_reader_config = build_mem_reader_config()
     reranker_config = build_reranker_config()
     feedback_reranker_config = build_feedback_reranker_config()
     internet_retriever_config = build_internet_retriever_config()
-    vector_db_config = build_vec_db_config()
-    pref_extractor_config = build_pref_extractor_config()
-    pref_adder_config = build_pref_adder_config()
-    pref_retriever_config = build_pref_retriever_config()
 
     logger.debug("Component configurations built successfully")
 
     # Create component instances
     graph_db = GraphStoreFactory.from_config(graph_db_config)
-    vector_db = (
-        VecDBFactory.from_config(vector_db_config)
-        if os.getenv("ENABLE_PREFERENCE_MEMORY", "false") == "true"
-        else None
-    )
     llm = LLMFactory.from_config(llm_config)
     chat_llms = (
         _init_chat_llms(chat_llm_config)
         if os.getenv("ENABLE_CHAT_API", "false") == "true"
         else None
     )
+    playground_chat_llms = (
+        _init_chat_llms(playground_chat_llm_config)
+        if os.getenv("ENABLE_CHAT_API", "false") == "true" and playground_chat_llm_config
+        else chat_llms
+    )
     embedder = EmbedderFactory.from_config(embedder_config)
+
+    plugin_context = build_plugin_context(
+        graph_db=graph_db,
+        embedder=embedder,
+        llm=llm,
+        default_cube_config=default_cube_config,
+        nli_client_config=nli_client_config,
+        mem_reader_config=mem_reader_config,
+        reranker_config=reranker_config,
+        feedback_reranker_config=feedback_reranker_config,
+        internet_retriever_config=internet_retriever_config,
+    )
+    plugin_manager.discover()
+    plugin_manager.init_components(plugin_context)
+
     # Pass graph_db to mem_reader for recall operations (deduplication, conflict detection)
-    mem_reader = MemReaderFactory.from_config(mem_reader_config, graph_db=graph_db)
+    mem_reader = MemReaderFactory.from_config(
+        mem_reader_config,
+        graph_db=graph_db,
+    )
     reranker = RerankerFactory.from_config(reranker_config)
     feedback_reranker = RerankerFactory.from_config(feedback_reranker_config)
     internet_retriever = InternetRetrieverFactory.from_config(
@@ -222,74 +238,9 @@ def init_server() -> dict[str, Any]:
 
     logger.debug("Text memory initialized")
 
-    # Initialize preference memory components
-    pref_extractor = (
-        ExtractorFactory.from_config(
-            config_factory=pref_extractor_config,
-            llm_provider=llm,
-            embedder=embedder,
-            vector_db=vector_db,
-        )
-        if os.getenv("ENABLE_PREFERENCE_MEMORY", "false") == "true"
-        else None
-    )
-
-    pref_adder = (
-        AdderFactory.from_config(
-            config_factory=pref_adder_config,
-            llm_provider=llm,
-            embedder=embedder,
-            vector_db=vector_db,
-            text_mem=text_mem,
-        )
-        if os.getenv("ENABLE_PREFERENCE_MEMORY", "false") == "true"
-        else None
-    )
-
-    pref_retriever = (
-        RetrieverFactory.from_config(
-            config_factory=pref_retriever_config,
-            llm_provider=llm,
-            embedder=embedder,
-            reranker=feedback_reranker,
-            vector_db=vector_db,
-        )
-        if os.getenv("ENABLE_PREFERENCE_MEMORY", "false") == "true"
-        else None
-    )
-
-    logger.debug("Preference memory components initialized")
-
-    # Initialize preference memory
-    pref_mem = (
-        SimplePreferenceTextMemory(
-            extractor_llm=llm,
-            vector_db=vector_db,
-            embedder=embedder,
-            reranker=feedback_reranker,
-            extractor=pref_extractor,
-            adder=pref_adder,
-            retriever=pref_retriever,
-        )
-        if os.getenv("ENABLE_PREFERENCE_MEMORY", "false") == "true"
-        else None
-    )
-
-    logger.debug("Preference memory initialized")
-
-    # Initialize MOS Server
-    mos_server = MOSServer(
-        mem_reader=mem_reader,
-        llm=llm,
-        online_bot=False,
-    )
-
-    logger.debug("MOS server initialized")
-
     # Create MemCube with pre-initialized memory instances
     naive_mem_cube = NaiveMemCube(
         text_mem=text_mem,
-        pref_mem=pref_mem,
         act_mem=None,
         para_mem=None,
     )
@@ -300,9 +251,12 @@ def init_server() -> dict[str, Any]:
     searcher: Searcher = tree_mem.get_searcher(
         manual_close_internet=os.getenv("ENABLE_INTERNET", "true").lower() == "false",
         moscube=False,
-        process_llm=mem_reader.llm,
+        process_llm=mem_reader.general_llm,
     )
     logger.debug("Searcher created")
+
+    # Set searcher to mem_reader
+    mem_reader.set_searcher(searcher)
 
     # Initialize feedback server
     feedback_server = SimpleMemFeedback(
@@ -313,18 +267,19 @@ def init_server() -> dict[str, Any]:
         mem_reader=mem_reader,
         searcher=searcher,
         reranker=feedback_reranker,
-        pref_mem=pref_mem,
+        pref_feedback=True,
     )
 
     # Initialize Scheduler
     scheduler_config_dict = APIConfig.get_scheduler_config()
     scheduler_config = SchedulerConfigFactory(
-        backend="optimized_scheduler", config=scheduler_config_dict
+        backend=scheduler_config_dict["backend"],
+        config=scheduler_config_dict["config"],
     )
     mem_scheduler: OptimizedScheduler = SchedulerFactory.from_config(scheduler_config)
     mem_scheduler.initialize_modules(
         chat_llm=llm,
-        process_llm=mem_reader.llm,
+        process_llm=mem_reader.general_llm,
         db_engine=BaseDBManager.create_default_sqlite_engine(),
         mem_reader=mem_reader,
         redis_client=redis_client,
@@ -336,6 +291,12 @@ def init_server() -> dict[str, Any]:
 
     # Initialize SchedulerAPIModule
     api_module = mem_scheduler.api_module
+
+    # Plugins keep a reference to the original context dict, so updating the shared
+    # section here makes the runtime handles visible without adding a second init step.
+    plugin_context["shared"]["mem_scheduler"] = mem_scheduler
+    plugin_context["shared"]["submit_scheduler_messages"] = mem_scheduler.submit_messages
+    plugin_context["shared"]["api_module"] = api_module
 
     # Start scheduler if enabled
     if os.getenv("API_SCHEDULER_ON", "true").lower() == "true":
@@ -362,22 +323,17 @@ def init_server() -> dict[str, Any]:
         "mem_reader": mem_reader,
         "llm": llm,
         "chat_llms": chat_llms,
+        "playground_chat_llms": playground_chat_llms,
         "embedder": embedder,
         "reranker": reranker,
         "internet_retriever": internet_retriever,
         "memory_manager": memory_manager,
         "default_cube_config": default_cube_config,
-        "mos_server": mos_server,
         "mem_scheduler": mem_scheduler,
         "naive_mem_cube": naive_mem_cube,
         "searcher": searcher,
         "api_module": api_module,
-        "vector_db": vector_db,
-        "pref_extractor": pref_extractor,
-        "pref_adder": pref_adder,
-        "pref_retriever": pref_retriever,
         "text_mem": text_mem,
-        "pref_mem": pref_mem,
         "online_bot": online_bot,
         "feedback_server": feedback_server,
         "redis_client": redis_client,

@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 from memos import log
 from memos.chunkers import ChunkerFactory
+from memos.configs.llm import LLMConfigFactory
 from memos.configs.mem_reader import SimpleStructMemReaderConfig
 from memos.context.context import ContextThreadPoolExecutor
 from memos.embedders.factory import EmbedderFactory
@@ -20,6 +21,8 @@ from memos.mem_reader.base import BaseMemReader
 
 if TYPE_CHECKING:
     from memos.graph_dbs.base import BaseGraphDB
+    from memos.memories.textual.tree_text_memory.retrieve.searcher import Searcher
+    from memos.types.general_types import UserContext
 from memos.mem_reader.read_multi_modal import coerce_scene_data, detect_lang
 from memos.mem_reader.utils import (
     count_tokens_text,
@@ -172,9 +175,27 @@ class SimpleStructMemReader(BaseMemReader, ABC):
             config: Configuration object for the reader
         """
         self.config = config
+        # Main LLM for chat/doc memory extraction (fine-tuned model)
         self.llm = LLMFactory.from_config(config.llm)
+        # General LLM for non-chat/doc tasks (hallucination filter, rewrite, merge, etc.)
+        # Falls back to main llm if not configured
+        self.general_llm = (
+            LLMFactory.from_config(config.general_llm)
+            if config.general_llm is not None
+            else self.llm
+        )
+        self.qwen_llm = None
+        qwen_llm_config = getattr(config, "qwen_llm", None)
+        if qwen_llm_config:
+            try:
+                if isinstance(qwen_llm_config, dict):
+                    qwen_llm_config = LLMConfigFactory.model_validate(qwen_llm_config)
+                self.qwen_llm = LLMFactory.from_config(qwen_llm_config)
+            except Exception as e:
+                logger.warning(f"[LLM] Qwen initialization failed: {e}")
         self.embedder = EmbedderFactory.from_config(config.embedder)
         self.chunker = ChunkerFactory.from_config(config.chunker)
+        self.save_rawfile = self.chunker.config.save_rawfile
         self.memory_max_length = 8000
         # Use token-based windowing; default to ~5000 tokens if not configured
         self.chat_window_max_tokens = getattr(self.config, "chat_window_max_tokens", 1024)
@@ -187,6 +208,9 @@ class SimpleStructMemReader(BaseMemReader, ABC):
     def set_graph_db(self, graph_db: "BaseGraphDB | None") -> None:
         self.graph_db = graph_db
 
+    def set_searcher(self, searcher: "Searcher | None") -> None:
+        self.searcher = searcher
+
     def _make_memory_item(
         self,
         value: str,
@@ -198,6 +222,7 @@ class SimpleStructMemReader(BaseMemReader, ABC):
         background: str = "",
         type_: str = "fact",
         confidence: float = 0.99,
+        need_embed: bool = True,
         **kwargs,
     ) -> TextualMemoryItem:
         """construct memory item"""
@@ -213,7 +238,7 @@ class SimpleStructMemReader(BaseMemReader, ABC):
                 status="activated",
                 tags=tags or [],
                 key=key if key is not None else derive_key(value),
-                embedding=self.embedder.embed([value])[0],
+                embedding=self.embedder.embed([value])[0] if need_embed else None,
                 usage=[],
                 sources=sources or [],
                 background=background,
@@ -223,6 +248,22 @@ class SimpleStructMemReader(BaseMemReader, ABC):
                 **kwargs,
             ),
         )
+
+    def _safe_generate(self, messages: list[dict]) -> str | None:
+        try:
+            return self.llm.generate(messages)
+        except Exception:
+            logger.exception("[LLM] Generation failed")
+            return None
+
+    def _safe_parse(self, text: str | None) -> dict | None:
+        if not text:
+            return None
+        try:
+            return parse_json_result(text)
+        except Exception:
+            logger.warning("[LLM] JSON parse failed")
+            return None
 
     def _get_llm_response(self, mem_str: str, custom_tags: list[str] | None) -> dict:
         lang = detect_lang(mem_str)
@@ -240,13 +281,13 @@ class SimpleStructMemReader(BaseMemReader, ABC):
         if self.config.remove_prompt_example:
             prompt = prompt.replace(examples, "")
         messages = [{"role": "user", "content": prompt}]
-        try:
-            response_text = self.llm.generate(messages)
-            response_json = parse_json_result(response_text)
-        except Exception as e:
-            logger.error(f"[LLM] Exception during chat generation: {e}")
-            response_json = {
-                "memory list": [
+
+        response_text = self._safe_generate(messages)
+        response_json = self._safe_parse(response_text)
+
+        if not response_json:
+            return {
+                "memory_list": [
                     {
                         "key": mem_str[:10],
                         "memory_type": "UserMemory",
@@ -256,6 +297,7 @@ class SimpleStructMemReader(BaseMemReader, ABC):
                 ],
                 "summary": mem_str,
             }
+
         return response_json
 
     def _iter_chat_windows(self, scene_data_info, max_tokens=None, overlap=200):
@@ -309,6 +351,14 @@ class SimpleStructMemReader(BaseMemReader, ABC):
             "custom_tags", None
         )  # must pop here, avoid add to info, only used in sync fine mode
 
+        user_context: UserContext | None = kwargs.get("user_context")
+        ctx_kwargs: dict[str, Any] = {}
+        if user_context:
+            if user_context.manager_user_id:
+                ctx_kwargs["manager_user_id"] = user_context.manager_user_id
+            if user_context.project_id:
+                ctx_kwargs["project_id"] = user_context.project_id
+
         if mode == "fast":
             logger.debug("Using unified Fast Mode")
 
@@ -318,7 +368,12 @@ class SimpleStructMemReader(BaseMemReader, ABC):
                 mem_type = "UserMemory" if roles == {"user"} else "LongTermMemory"
                 tags = ["mode:fast"]
                 return self._make_memory_item(
-                    value=text, info=info, memory_type=mem_type, tags=tags, sources=w["sources"]
+                    value=text,
+                    info=info,
+                    memory_type=mem_type,
+                    tags=tags,
+                    sources=w["sources"],
+                    **ctx_kwargs,
                 )
 
             with ContextThreadPoolExecutor(max_workers=8) as ex:
@@ -354,6 +409,7 @@ class SimpleStructMemReader(BaseMemReader, ABC):
                             key=m.get("key", ""),
                             sources=w["sources"],
                             background=resp.get("summary", ""),
+                            **ctx_kwargs,
                         )
                         chat_read_nodes.append(node)
                     except Exception as e:
@@ -365,6 +421,14 @@ class SimpleStructMemReader(BaseMemReader, ABC):
     ):
         raw_memory = raw_node.memory
         response_json = self._get_llm_response(raw_memory, custom_tags)
+
+        user_context: UserContext | None = kwargs.get("user_context")
+        ctx_kwargs: dict[str, Any] = {}
+        if user_context:
+            if user_context.manager_user_id:
+                ctx_kwargs["manager_user_id"] = user_context.manager_user_id
+            if user_context.project_id:
+                ctx_kwargs["project_id"] = user_context.project_id
 
         chat_read_nodes = []
         for memory_i_raw in response_json.get("memory list", []):
@@ -392,6 +456,7 @@ class SimpleStructMemReader(BaseMemReader, ABC):
                     background=response_json.get("summary", ""),
                     type_="fact",
                     confidence=0.99,
+                    **ctx_kwargs,
                 )
                 chat_read_nodes.append(node_i)
             except Exception as e:
@@ -406,6 +471,7 @@ class SimpleStructMemReader(BaseMemReader, ABC):
         info: dict[str, Any],
         mode: str = "fine",
         user_name: str | None = None,
+        **kwargs,
     ) -> list[list[TextualMemoryItem]]:
         """
         Extract and classify memory content from scene_data.
@@ -449,7 +515,9 @@ class SimpleStructMemReader(BaseMemReader, ABC):
         # Backward compatibility, after coercing scene_data, we only tackle
         # with standard scene_data type: MessagesType
         standard_scene_data = coerce_scene_data(scene_data, type)
-        return self._read_memory(standard_scene_data, type, info, mode, user_name=user_name)
+        return self._read_memory(
+            standard_scene_data, type, info, mode, user_name=user_name, **kwargs
+        )
 
     def rewrite_memories(
         self, messages: list[dict], memory_list: list[TextualMemoryItem], user_only: bool = True
@@ -479,8 +547,9 @@ class SimpleStructMemReader(BaseMemReader, ABC):
         prompt = template.format(**prompt_args)
 
         # Optionally run filter and parse the output
+        # Use general_llm for rewrite (not fine-tuned for this task)
         try:
-            raw = self.llm.generate([{"role": "user", "content": prompt}])
+            raw = self.general_llm.generate([{"role": "user", "content": prompt}])
             success, parsed = parse_rewritten_response(raw)
             logger.info(
                 f"[rewrite_memories] Hallucination filter parsed successfully: {success}；prompt: {prompt}"
@@ -539,8 +608,9 @@ class SimpleStructMemReader(BaseMemReader, ABC):
         prompt = template.format(**prompt_args)
 
         # Optionally run filter and parse the output
+        # Use general_llm for hallucination filter (not fine-tuned for this task)
         try:
-            raw = self.llm.generate([{"role": "user", "content": prompt}])
+            raw = self.general_llm.generate([{"role": "user", "content": prompt}])
             success, parsed = parse_keep_filter_response(raw)
             logger.info(
                 f"[filter_hallucination_in_memories] Hallucination filter parsed successfully: {success}；prompt: {prompt}"
